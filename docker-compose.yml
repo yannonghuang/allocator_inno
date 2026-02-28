@@ -1,0 +1,71 @@
+# Default: dev mode (hot reload). Use docker-compose.prod.yml for production.
+# Usage: docker compose up --build
+
+services:
+  db:
+    image: pgvector/pgvector:pg17 #postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: allocator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d allocator"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/allocator
+      CSV_ROOT_PATH: /app/csv
+    volumes:
+      - ./backend:/app
+      - ./csv:/app/csv:ro
+    # Long keep-alive so proxies don't close; allocation runs in background so request returns quickly
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 300
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      API_BACKEND_URL: http://backend:8000
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    command: npm run dev
+    depends_on:
+      - backend
+
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: securepassword
+    ports:
+      - 10000:80
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin/
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
+  frontend_node_modules:
+  pgadmin-data:
