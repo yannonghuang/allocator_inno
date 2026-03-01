@@ -1,13 +1,15 @@
 from typing import Any, List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
-from app.models import Case, AllocationRun, AllocationAction, Demand, Supply
+from app.models import Case, AllocationRun, AllocationAction, Demand, Supply, Customer
 from app.schemas import AllocationRunResponse, AllocationActionResponse
 from app.services.case_loader import load_case_data
 from app.services.allocation_engine import run_allocation
+from app.services.planning_engine import run_planning
+from app.services.planning_copilot import planning_copilot_reply
 from app.services.time_utils import build_period_index, demand_due_period, period_to_date
 
 router = APIRouter(tags=["Allocation"])
@@ -148,6 +150,8 @@ def _feasible_demands_from_actions(db: Session, case_id: int, actions: list) -> 
     demand_list_raw = [{"request_due_time": getattr(d, "request_due_time", None)} for d in demands_q]
     date_to_period, sorted_dates = build_period_index(supply_list, demand_list_raw)
     demands = demands_q
+    customers_q = db.query(Customer).filter(Customer.case_id == case_id).all()
+    cust_by_id = {c.customer: (c.description or c.customer) for c in customers_q}
     by_demand: dict[str, dict] = {}
     for d in demands:
         due_per = demand_due_period(d.request_due_time, date_to_period)
@@ -158,6 +162,8 @@ def _feasible_demands_from_actions(db: Session, case_id: int, actions: list) -> 
             "due_period": due_per,
             "request_due_time": getattr(d, "request_due_time", None),
             "revised_period": None,  # latest output_period among actions serving this demand
+            "customer_id": d.customer_id,
+            "customer": cust_by_id.get(d.customer_id, d.customer_id),
         }
     # demands by product_id (order preserved from demands = priority order)
     demands_by_product: dict[str, list] = {}
@@ -204,6 +210,8 @@ def _feasible_demands_from_actions(db: Session, case_id: int, actions: list) -> 
         fulfillment_rate = (alloc / req) if req > 0 else None
         result.append({
             "demand_id": did,
+            "customer_id": v.get("customer_id"),
+            "customer": v.get("customer"),
             "product_id": v["product_id"],
             "requested_qty": req,
             "allocated_qty": alloc,
@@ -263,6 +271,46 @@ def get_feasible_demands(case_id: int, run_id: int, db: Session = Depends(get_db
     ).filter(AllocationAction.run_id == run_id).all()
     feasible = _feasible_demands_from_actions(db, case_id, action_rows)
     return {"feasible_demands": feasible}
+
+
+@router.post("/cases/{case_id}/plan", response_model=dict)
+def run_plan(case_id: int, db: Session = Depends(get_db), body: dict | None = Body(None)):
+    """
+    Demand-to-supply planning: takes case demands and supplies, returns committed demands
+    (with commit_time per quantity) and planned work orders.
+    Optional body: { "config": { "variant_selection": { "multiple": false } } } to use single best variant; omit for all feasible.
+    """
+    c = db.query(Case).filter(Case.id == case_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
+    data = load_case_data(db, case_id)
+    if not data.get("demand"):
+        raise HTTPException(status_code=400, detail="No demand data")
+    if not data.get("supply"):
+        raise HTTPException(status_code=400, detail="No supply data")
+    config = (body or {}).get("config")
+    result = run_planning(data, config=config)
+    return result
+
+
+@router.post("/cases/{case_id}/planning-copilot", response_model=dict)
+def planning_copilot(case_id: int, db: Session = Depends(get_db), body: dict | None = Body(None)):
+    """
+    Chat endpoint for planning config: interpret natural-language message into a reply and optional config update.
+    Body: { "message": str, "current_config": dict, "history": [{"role": "user"|"assistant", "text": str}] }.
+    Returns: { "reply": str, "config_update": dict | null }. Uses LLM when OPENAI_API_KEY is set.
+    """
+    c = db.query(Case).filter(Case.id == case_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Case not found")
+    payload = body or {}
+    message = (payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    current_config = payload.get("current_config") or {}
+    history = payload.get("history") or []
+    reply, config_update = planning_copilot_reply(message, current_config, history)
+    return {"reply": reply, "config_update": config_update}
 
 
 @router.get("/cases/{case_id}/runs/{run_id}", response_model=dict)

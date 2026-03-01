@@ -19,6 +19,12 @@ type Props<T> = {
   rowId?: (row: T) => string | undefined;
   /** Optional: row click handler (e.g. open pegging slide-in). */
   onRowClick?: (row: T) => void;
+  /** When true, thead stays visible while scrolling the table body. Uses a dedicated scroll wrapper so headers stick in the UI. */
+  stickyHeader?: boolean;
+  /** Max height of the table scroll area when stickyHeader is true (default 70vh). */
+  stickyHeaderScrollMaxHeight?: string;
+  /** Placeholder for the filter input (e.g. "Filter by customer, product…"). */
+  filterPlaceholder?: string;
 };
 
 export function SortFilterTable<T extends Record<string, unknown>>({
@@ -29,6 +35,9 @@ export function SortFilterTable<T extends Record<string, unknown>>({
   idKey,
   rowId,
   onRowClick,
+  stickyHeader = false,
+  stickyHeaderScrollMaxHeight = '70vh',
+  filterPlaceholder = 'Filter…',
 }: Props<T>) {
   const [filter, setFilter] = useState('');
   const [sortKey, setSortKey] = useState<keyof T | string | null>(defaultSortKey ?? null);
@@ -73,19 +82,39 @@ export function SortFilterTable<T extends Record<string, unknown>>({
         <div style={{ marginBottom: '0.5rem' }}>
           <input
             type="text"
-            placeholder="Filter..."
+            placeholder={filterPlaceholder}
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             style={{ width: '100%', maxWidth: 320 }}
+            aria-label="Filter table rows"
           />
         </div>
       )}
-      <div style={{ overflowX: 'auto' }}>
-        <table>
+      <div
+        style={
+          stickyHeader
+            ? { overflow: 'auto', maxHeight: stickyHeaderScrollMaxHeight, overflowX: 'auto' as const }
+            : { overflowX: 'auto' }
+        }
+      >
+        <table style={stickyHeader ? { borderCollapse: 'collapse' } : undefined}>
           <thead>
             <tr>
               {columns.map((col) => (
-                <th key={String(col.key)}>
+                <th
+                  key={String(col.key)}
+                  style={
+                    stickyHeader
+                      ? {
+                          position: 'sticky',
+                          top: 0,
+                          zIndex: 1,
+                          background: '#1c1c1e',
+                          boxShadow: '0 1px 0 0 #3d3d40',
+                        }
+                      : undefined
+                  }
+                >
                   {col.sortable !== false ? (
                     <button
                       type="button"

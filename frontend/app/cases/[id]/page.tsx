@@ -19,6 +19,14 @@ import {
   getAllocationView,
   getAllocationViewBasket,
   getAllocationActions,
+  runPlan,
+  planningCopilot,
+  type PlanningConfig,
+  type PlanningCopilotMessage,
+  type CommittedDemand,
+  type WorkOrder,
+  type PlanningPeggingNode,
+  type PlanningPeggingEntry,
   type AllocationActionRow,
   getAllocationExplanation,
   getPegging,
@@ -72,8 +80,72 @@ export default function CaseDetail() {
   const allocationViewFetchingRef = useRef<boolean>(false);
   const activeViewRef = useRef<'supply' | 'allocation' | 'suggested' | 'raw-material'>('supply');
   const selectedRunIdRef = useRef<number | null>(null);
+  const [caseSection, setCaseSection] = useState<'allocation' | 'planning'>('allocation');
   const [rawMaterialReport, setRawMaterialReport] = useState<RawMaterialUsageReport | null>(null);
   const [rawMaterialReportLoading, setRawMaterialReportLoading] = useState(false);
+  const [planResult, setPlanResult] = useState<{ committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] } | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
+  const [planPeggingContext, setPlanPeggingContext] = useState<{ type: 'demand'; row: CommittedDemand } | { type: 'work_order'; row: WorkOrder } | null>(null);
+  const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
+  const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
+  const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
+  const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
+  const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders'>('demands');
+  const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({});
+  const [copilotOpen, setCopilotOpen] = useState(false);
+  const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
+  const [copilotInput, setCopilotInput] = useState('');
+  const [copilotLoading, setCopilotLoading] = useState(false);
+  const [copilotPanelWidth, setCopilotPanelWidth] = useState(440);
+  const copilotResizeRef = useRef<{ startX: number; startW: number } | null>(null);
+  const [copilotResizing, setCopilotResizing] = useState(false);
+  const copilotMessagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  /** Rule-based intent: map user message to config updates and a reply for get_preferred_variants() behavior. */
+  function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
+    const t = message.trim().toLowerCase();
+    const vs = currentConfig.variant_selection ?? {};
+    const multi = vs.multiple;
+
+    if (!t) return { reply: 'You can ask to use a single best variant, or to split demand across all feasible variants. Say "show config" to see current settings.' };
+
+    if (/show|current|what('s| is)? (my )?config|settings|config/.test(t)) {
+      const mode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
+      return { reply: `Current variant selection: **${mode}**. Change it by saying e.g. "use single variant" or "split across all variants".` };
+    }
+
+    if (/single|one variant|only one|best variant|use one/.test(t)) {
+      return {
+        reply: 'Set variant selection to **single best variant**. The planner will pick one best BOM/variant per demand (by score: earliest commit, most inventory consumed, least purchase). Re-run plan to apply.',
+        configUpdate: { variant_selection: { ...vs, multiple: false } },
+      };
+    }
+
+    if (/all variants|split|multiple variants|every variant|equal split|divide (across|among)/.test(t)) {
+      return {
+        reply: 'Set variant selection to **all feasible variants** with equal split. Demand will be divided among all feasible BOM/variants (integer quantities when demand is integer). Re-run plan to apply.',
+        configUpdate: { variant_selection: { ...vs, multiple: true } },
+      };
+    }
+
+    if (/reset|default|clear/.test(t)) {
+      return {
+        reply: 'Reset to default: **all feasible variants** (equal split). Re-run plan to apply.',
+        configUpdate: { variant_selection: { multiple: true } },
+      };
+    }
+
+    return {
+      reply: 'I only handle variant selection for planning. Try: "use single variant", "split across all variants", or "show config".',
+    };
+  }
+
+  useEffect(() => {
+    copilotMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [copilotMessages]);
 
   const basketInitialKeys = new Set(basketInitial.map((b) => b.key));
 
@@ -369,6 +441,50 @@ export default function CaseDetail() {
     };
   }, [peggingResizing]);
 
+  useEffect(() => {
+    if (!planPeggingResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = planPeggingResizeRef.current;
+      if (!r) return;
+      const delta = r.startX - e.clientX;
+      setPlanPeggingPanelWidth(Math.min(window.innerWidth * 0.9, Math.max(320, r.startW + delta)));
+    };
+    const onUp = () => {
+      planPeggingResizeRef.current = null;
+      setPlanPeggingResizing(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [planPeggingResizing]);
+
+  useEffect(() => {
+    if (!copilotResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const r = copilotResizeRef.current;
+      if (!r) return;
+      const delta = r.startX - e.clientX;
+      setCopilotPanelWidth(Math.min(window.innerWidth * 0.9, Math.max(320, r.startW + delta)));
+    };
+    const onUp = () => {
+      copilotResizeRef.current = null;
+      setCopilotResizing(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [copilotResizing]);
+
   // Defer tree building so first paint shows counts and "Building tree…" instead of blocking on huge graph
   useEffect(() => {
     if (!peggingData) {
@@ -614,6 +730,23 @@ export default function CaseDetail() {
       <p><Link href="/">← Cases</Link></p>
       <h1>{c.name}</h1>
       {error && <p style={{ color: '#f87171' }}>{error}</p>}
+      <nav style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', borderBottom: '1px solid #e4e4e7', paddingBottom: '0.5rem' }}>
+        <button
+          type="button"
+          className={caseSection === 'allocation' ? '' : 'secondary'}
+          onClick={() => setCaseSection('allocation')}
+        >
+          Allocation
+        </button>
+        <button
+          type="button"
+          className={caseSection === 'planning' ? '' : 'secondary'}
+          onClick={() => setCaseSection('planning')}
+        >
+          Planning
+        </button>
+      </nav>
+      {caseSection === 'allocation' && (
       <section>
         <h2>Allocation</h2>
         <button onClick={handleAllocate} disabled={allocating}>{allocating ? 'Running…' : 'Run allocation'}</button>
@@ -1152,10 +1285,34 @@ export default function CaseDetail() {
                   const totalRequested = feasibleDemands.reduce((s, f) => s + (Number(f.requested_qty) || 0), 0);
                   const totalAllocated = feasibleDemands.reduce((s, f) => s + (Number(f.allocated_qty) || 0), 0);
                   const overallRate = totalRequested > 0 ? (totalAllocated / totalRequested) * 100 : 0;
+                  const byCustomer = feasibleDemands.reduce<Record<string, { requested: number; allocated: number }>>((acc, f) => {
+                    const c = (f.customer ?? f.customer_id ?? '–') as string;
+                    if (!acc[c]) acc[c] = { requested: 0, allocated: 0 };
+                    acc[c].requested += Number(f.requested_qty) || 0;
+                    acc[c].allocated += Number(f.allocated_qty) || 0;
+                    return acc;
+                  }, {});
                   return (
-                    <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                      Overall fulfillment: <strong>{totalAllocated.toLocaleString()}</strong> / <strong>{totalRequested.toLocaleString()}</strong> requested = <strong>{overallRate.toFixed(1)}%</strong>
-                    </p>
+                    <>
+                      <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                        Overall fulfillment: <strong>{totalAllocated.toLocaleString()}</strong> / <strong>{totalRequested.toLocaleString()}</strong> requested = <strong>{overallRate.toFixed(1)}%</strong>
+                      </p>
+                      {Object.keys(byCustomer).length > 1 && (
+                        <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                          <summary style={{ cursor: 'pointer' }}>Rollup by customer</summary>
+                          <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
+                            {Object.entries(byCustomer).map(([cust, { requested, allocated }]) => {
+                              const rate = requested > 0 ? (allocated / requested) * 100 : 0;
+                              return (
+                                <li key={cust}>
+                                  <strong>{cust}</strong>: {allocated.toLocaleString()} / {requested.toLocaleString()} = {rate.toFixed(1)}%
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </details>
+                      )}
+                    </>
                   );
                 })()}
                 <SortFilterTable<FeasibleDemand & { suggested_revision?: string }>
@@ -1166,10 +1323,11 @@ export default function CaseDetail() {
                 }))}
                 rowId={(r) => `demand-${r.demand_id}`}
                 onRowClick={handleDemandPeggingClick}
-                filterKeys={['demand_id', 'product_id', 'status', 'suggested_revision', 'request_due_time', 'revised_time', 'fulfillment_rate']}
+                filterKeys={['demand_id', 'customer', 'customer_id', 'product_id', 'status', 'suggested_revision', 'request_due_time', 'revised_time', 'fulfillment_rate']}
                 defaultSortKey="fulfillment_rate"
                 columns={[
                   { key: 'demand_id', label: 'Demand ID', sortable: true },
+                  { key: 'customer', label: 'Customer', sortable: true, render: (r) => r.customer ?? r.customer_id ?? '–' },
                   { key: 'request_due_time', label: 'Time', sortable: true, render: (r) => r.request_due_time ?? '–' },
                   { key: 'revised_time', label: 'Revised time', sortable: true, render: (r) => r.revised_time ?? '–' },
                   { key: 'product_id', label: 'Product', sortable: true },
@@ -1187,6 +1345,470 @@ export default function CaseDetail() {
           </>
         )}
       </section>
+      )}
+      {caseSection === 'planning' && (
+      <section>
+        <h2>Planning</h2>
+        <p style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+          Demand-to-supply planning: takes customer demands and outputs committed demands (with commit_time) and planned work orders.
+          Use <strong>Configure planning (copilot)</strong> to set how variants are chosen (single best vs. split across all).
+        </p>
+        <div style={{ marginBottom: '0.75rem' }}>
+          <button
+            type="button"
+            disabled={planLoading}
+            onClick={() => {
+              setPlanError(null);
+              setPlanLoading(true);
+              runPlan(id, Object.keys(planningConfig).length ? planningConfig : undefined)
+                .then(setPlanResult)
+                .catch((e) => setPlanError(e instanceof Error ? e.message : 'Plan failed'))
+                .finally(() => setPlanLoading(false));
+            }}
+          >
+            {planLoading ? 'Running plan…' : 'Run plan'}
+          </button>
+          <span style={{ marginLeft: '1rem' }} />
+          <button
+            type="button"
+            onClick={() => setCopilotOpen((o) => !o)}
+            aria-expanded={copilotOpen}
+            style={{
+              padding: '6px 12px',
+              background: copilotOpen ? '#3b82f6' : 'transparent',
+              color: copilotOpen ? '#fff' : '#3b82f6',
+              border: '1px solid #3b82f6',
+              borderRadius: 6,
+              cursor: 'pointer',
+              fontWeight: 500,
+            }}
+          >
+            {copilotOpen ? 'Hide copilot' : 'Configure planning (copilot)'}
+          </button>
+        </div>
+        {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
+        {planResult && !planLoading && (
+          <>
+            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1.5rem', marginBottom: '0.5rem' }}>
+              <button
+                type="button"
+                className={planResultTab === 'demands' ? '' : 'secondary'}
+                onClick={() => setPlanResultTab('demands')}
+              >
+                Committed demands
+              </button>
+              <button
+                type="button"
+                className={planResultTab === 'work_orders' ? '' : 'secondary'}
+                onClick={() => setPlanResultTab('work_orders')}
+              >
+                Work orders
+              </button>
+            </div>
+            <div style={{ border: '1px solid #3d3d40', borderRadius: 6 }}>
+              {planResultTab === 'demands' && (
+                <div style={{ padding: '0.75rem 1rem' }}>
+                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Committed demands</h4>
+                  {planResult.committed_demands.length > 0 && (() => {
+                    const byCustomer = planResult.committed_demands.reduce<Record<string, number>>((acc, r) => {
+                      const c = (r.customer ?? r.customer_id ?? '–') as string;
+                      acc[c] = (acc[c] ?? 0) + (Number(r.quantity) || 0);
+                      return acc;
+                    }, {});
+                    const hasMultipleCustomers = Object.keys(byCustomer).length > 1;
+                    return hasMultipleCustomers ? (
+                      <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                        <summary style={{ cursor: 'pointer' }}>Rollup by customer</summary>
+                        <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
+                          {Object.entries(byCustomer).map(([cust, qty]) => (
+                            <li key={cust}><strong>{cust}</strong>: {Number(qty).toLocaleString()} committed</li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null;
+                  })()}
+                  <SortFilterTable<CommittedDemand & { _key?: string; _customer?: string }>
+                    idKey="_key"
+                    rows={planResult.committed_demands.map((r, i) => ({
+                      ...r,
+                      _key: `cd-${r.demand_id ?? ''}-${r.product_id}-${r.location_id}-${i}`,
+                      _customer: String(r.customer ?? r.customer_id ?? ''),
+                    }))}
+                    filterKeys={['demand_id', '_customer', 'product_id', 'location_id', 'commit_time', 'commit_reason']}
+                    filterPlaceholder="Filter by demand ID, customer, product, location…"
+                    defaultSortKey="commit_time"
+                    stickyHeader
+                    columns={[
+                      { key: 'demand_id', label: 'Demand ID', sortable: true, render: (r) => r.demand_id ?? '–' },
+                      { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
+                      { key: 'product_id', label: 'Product', sortable: true },
+                      { key: 'location_id', label: 'Location', sortable: true },
+                      { key: 'quantity', label: 'Quantity', sortable: true },
+                      { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
+                      { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
+                      { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => r.commit_reason ?? '–' },
+                      { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => (
+                        <button type="button" className="secondary" onClick={() => { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); }}>Show</button>
+                      ) },
+                    ]}
+                  />
+                </div>
+              )}
+              {planResultTab === 'work_orders' && (
+                <div style={{ padding: '0.75rem 1rem' }}>
+                  <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Work orders</h4>
+                  {planResult.work_orders.length > 0 && (() => {
+                    const byProdArea = planResult.work_orders.reduce<Record<string, number>>((acc, r) => {
+                      const pa = (r.prod_area ?? '–') as string;
+                      acc[pa] = (acc[pa] ?? 0) + (Number(r.quantity) || 0);
+                      return acc;
+                    }, {});
+                    const hasMultipleAreas = Object.keys(byProdArea).length > 1;
+                    return hasMultipleAreas ? (
+                      <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                        <summary style={{ cursor: 'pointer' }}>Rollup by PROD_AREA</summary>
+                        <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
+                          {Object.entries(byProdArea).map(([area, qty]) => (
+                            <li key={area}><strong>{area}</strong>: {Number(qty).toLocaleString()} quantity</li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null;
+                  })()}
+                  <SortFilterTable<WorkOrder & { _key?: string; _prod_area?: string }>
+                    idKey="_key"
+                    rows={planResult.work_orders.map((r, i) => ({
+                      ...r,
+                      _key: `wo-${i}-${r.product_id}-${r.location_id}`,
+                      _prod_area: String(r.prod_area ?? ''),
+                    }))}
+                    filterKeys={['product_id', 'location_id', '_prod_area', 'method', 'start_time', 'end_time']}
+                    filterPlaceholder="Filter by product, location, PROD_AREA, method…"
+                    defaultSortKey="start_time"
+                    stickyHeader
+                    columns={[
+                      { key: 'product_id', label: 'Product', sortable: true },
+                      { key: 'location_id', label: 'Location', sortable: true },
+                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => (r as { _prod_area?: string })._prod_area || r.prod_area ?? '–' },
+                      { key: 'quantity', label: 'Quantity', sortable: true },
+                      { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
+                      { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
+                      { key: 'method', label: 'Method', sortable: true },
+                      { key: 'location_source', label: 'Location source', sortable: true, render: (r) => r.location_source ?? '–' },
+                      { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => (
+                        <button type="button" className="secondary" onClick={() => { setPlanPeggingContext({ type: 'work_order', row: r }); setPlanPeggingOpen(true); }}>Show</button>
+                      ) },
+                    ]}
+                  />
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </section>
+      )}
+      {copilotOpen && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9998,
+            display: 'flex',
+            justifyContent: 'flex-end',
+            pointerEvents: 'auto',
+          }}
+          role="dialog"
+          aria-label="Planning copilot"
+        >
+          <div
+            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
+            onClick={() => setCopilotOpen(false)}
+            aria-hidden
+          />
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: 'relative',
+              zIndex: 10,
+              width: copilotPanelWidth,
+              maxWidth: '90vw',
+              minWidth: 320,
+              height: '100vh',
+              display: 'flex',
+              flexDirection: 'column',
+              background: '#1c1c1e',
+              color: '#e4e4e7',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+              pointerEvents: 'auto',
+            }}
+          >
+            <div
+              role="separator"
+              aria-label="Resize copilot panel"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                copilotResizeRef.current = { startX: e.clientX, startW: copilotPanelWidth };
+                setCopilotResizing(true);
+              }}
+              style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: 6,
+                cursor: 'col-resize',
+                zIndex: 11,
+              }}
+            />
+            <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #3d3d40', flexShrink: 0 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                <h3 style={{ margin: 0, color: '#fafafa' }}>Planning copilot</h3>
+                <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              </div>
+              <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
+                Variant selection: <strong>{planningConfig.variant_selection?.multiple === false ? 'single best' : 'all feasible (equal split)'}</strong>. Express your requirements in natural language; the system may ask follow-up questions to clarify.
+              </p>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
+              {copilotMessages.length === 0 && (
+                <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>
+                  Ask how to configure <code style={{ background: '#27272a', padding: '2px 6px', borderRadius: 4 }}>get_preferred_variants()</code>. Examples: &quot;use only one variant per demand&quot;, &quot;split demand across all feasible variants&quot;, &quot;show current config&quot;. With an LLM enabled, you can use natural language and the assistant may ask clarifying questions.
+                </p>
+              )}
+              {copilotMessages.map((m, i) => (
+                <div key={i} style={{ marginBottom: '0.75rem' }}>
+                  <span style={{ fontWeight: 600, color: m.role === 'user' ? '#a78bfa' : '#67e8f9', fontSize: '0.8rem' }}>{m.role === 'user' ? 'You' : 'Copilot'}: </span>
+                  <span style={{ whiteSpace: 'pre-wrap', fontSize: '0.875rem' }}>{m.text.replace(/\*\*(.*?)\*\*/g, '$1')}</span>
+                </div>
+              ))}
+              {copilotLoading && <p style={{ margin: 0, fontSize: '0.875rem', color: '#a1a1aa' }}>Thinking…</p>}
+              <div ref={copilotMessagesEndRef} />
+            </div>
+            <form
+              style={{ padding: '1rem 1.25rem', borderTop: '1px solid #3d3d40', flexShrink: 0 }}
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const text = copilotInput.trim();
+                if (!text || copilotLoading) return;
+                setCopilotMessages((prev) => [...prev, { role: 'user', text }]);
+                setCopilotInput('');
+                setCopilotLoading(true);
+                try {
+                  const res = await planningCopilot(id, text, planningConfig, copilotMessages);
+                  if (res.config_update) setPlanningConfig((prev) => ({ ...prev, ...res.config_update! }));
+                  setCopilotMessages((prev) => [...prev, { role: 'assistant', text: res.reply }]);
+                } catch {
+                  const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
+                  if (configUpdate) setPlanningConfig((prev) => ({ ...prev, ...configUpdate }));
+                  setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
+                } finally {
+                  setCopilotLoading(false);
+                }
+              }}
+            >
+              <input
+                type="text"
+                value={copilotInput}
+                onChange={(e) => setCopilotInput(e.target.value)}
+                placeholder="e.g. I want to use a single best variant"
+                disabled={copilotLoading}
+                style={{ width: '100%', padding: '8px 12px', background: '#27272a', border: '1px solid #3d3d40', borderRadius: 6, color: '#fafafa' }}
+                aria-label="Chat with planning copilot"
+              />
+              <button type="submit" disabled={copilotLoading} className="secondary" style={{ marginTop: '0.5rem' }}>Send</button>
+            </form>
+          </div>
+        </div>,
+        document.body
+      )}
+      {planPeggingOpen && planPeggingContext && planResult && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9998,
+            display: 'flex',
+            justifyContent: 'flex-end',
+            pointerEvents: 'auto',
+          }}
+          role="dialog"
+          aria-label="Planning pegging"
+        >
+          <div
+            style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); }}
+            aria-hidden
+          />
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: 'relative',
+              zIndex: 10,
+              width: planPeggingPanelWidth,
+              maxWidth: '90vw',
+              minWidth: 320,
+              maxHeight: '100vh',
+              overflow: 'auto',
+              background: '#1c1c1e',
+              color: '#e4e4e7',
+              boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
+              padding: '1.25rem',
+              pointerEvents: 'auto',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
+            <div
+              role="separator"
+              aria-label="Resize planning pegging panel"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                planPeggingResizeRef.current = { startX: e.clientX, startW: planPeggingPanelWidth };
+                setPlanPeggingResizing(true);
+              }}
+              style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: 6,
+                cursor: 'col-resize',
+                zIndex: 11,
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ margin: 0, color: '#fafafa' }}>
+                {planPeggingContext.type === 'demand'
+                  ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
+                  : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
+              </h3>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+            </div>
+            <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
+              ▢ Inventory (static state) and ⚙ Work order (transformation). Root = target inventory; work orders transform between states; leaves = supply or purchase inventory.
+            </p>
+            {(() => {
+              const demandId = planPeggingContext.type === 'demand'
+                ? planPeggingContext.row.demand_id
+                : (planPeggingContext.row as WorkOrder).demand_id;
+              const entry = planResult.planning_pegging?.find((e) => e.demand_id === demandId);
+              const tree = entry?.tree;
+              if (!tree) {
+                return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
+              }
+              function renderNode(node: PlanningPeggingNode, path: string, depth: number) {
+                const childrenList = node.children ?? [];
+                const hasChildren = childrenList.length > 0;
+                const isRoot = path === '0';
+                const expandable = hasChildren || isRoot;
+                const isExpanded = planPeggingExpanded.has(path);
+                const toggle = () => setPlanPeggingExpanded((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(path)) next.delete(path);
+                  else next.add(path);
+                  return next;
+                });
+                const isInventory = node.type === 'demand' || node.type === 'supply' || node.type === 'purchase';
+                const icon = isInventory ? '▢' : '⚙';
+                const typeLabel = isInventory ? 'Inventory' : 'Work order';
+                const label = node.type === 'demand'
+                  ? `${node.demand_id ?? node.product_id} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}`
+                  : node.type === 'work_order'
+                    ? `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()}${node.end_time ? ` · end ${node.end_time}` : ''}`
+                    : node.type === 'supply'
+                      ? `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} (supply)`
+                      : `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} (purchase)`;
+                const indentPx = 12;
+                return (
+                  <div key={path} style={{ marginBottom: 4 }}>
+                    <button
+                      type="button"
+                      onClick={toggle}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        width: '100%',
+                        textAlign: 'left',
+                        padding: '4px 6px',
+                        background: depth % 2 === 0 ? 'rgba(255,255,255,0.04)' : 'transparent',
+                        border: 'none',
+                        borderRadius: 4,
+                        color: '#e4e4e7',
+                        cursor: expandable ? 'pointer' : 'default',
+                        fontSize: '0.85rem',
+                      }}
+                    >
+                      <span style={{ width: 14, flexShrink: 0 }}>{expandable ? (isExpanded ? '▼' : '▶') : '·'}</span>
+                      <span style={{ width: 18, flexShrink: 0, fontSize: '0.9em' }} title={isInventory ? 'Inventory (state)' : 'Work order (transformation)'}>{icon}</span>
+                      <span style={{ flex: 1 }}>
+                        <span style={{ color: isInventory ? '#a78bfa' : '#34d399', fontWeight: 600 }}>{typeLabel}</span>
+                        {' '}
+                        {label}
+                      </span>
+                    </button>
+                    {node.type === 'work_order' && (node.method_choice_explanation || node.variant_choice_explanation) && (() => {
+                      const explanationPath = `explain-${path}`;
+                      const isExplanationOpen = planExplanationExpanded.has(explanationPath);
+                      const toggleExplanation = () => setPlanExplanationExpanded((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(explanationPath)) next.delete(explanationPath);
+                        else next.add(explanationPath);
+                        return next;
+                      });
+                      return (
+                        <div style={{ marginTop: 4, marginLeft: 4, fontSize: '0.75rem', color: '#a1a1aa' }}>
+                          <button
+                            type="button"
+                            onClick={toggleExplanation}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 4,
+                              padding: '2px 0',
+                              background: 'none',
+                              border: 'none',
+                              color: '#71717a',
+                              cursor: 'pointer',
+                              fontSize: '0.75rem',
+                            }}
+                          >
+                            {isExplanationOpen ? '▼' : '▶'}
+                            Why (method / variant)
+                          </button>
+                          {isExplanationOpen && (
+                            <div style={{ paddingLeft: 8, borderLeft: '2px solid #3d3d40', marginTop: 2 }}>
+                              {node.method_choice_explanation && (
+                                <p style={{ margin: '0 0 4px', lineHeight: 1.35 }}><strong>Method:</strong> {node.method_choice_explanation}</p>
+                              )}
+                              {node.variant_choice_explanation && (
+                                <p style={{ margin: 0, lineHeight: 1.35 }}><strong>Variant:</strong> {node.variant_choice_explanation}</p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                    {expandable && isExpanded && (
+                      <div style={{ marginTop: 2, paddingLeft: indentPx }}>
+                        {hasChildren
+                          ? childrenList.map((child, i) => renderNode(child, `${path}-${i}`, depth + 1))
+                          : <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No work orders — planning failed or no method for this demand.</p>}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+              return <div style={{ marginTop: '0.5rem' }}>{renderNode(tree, '0', 0)}</div>;
+            })()}
+          </div>
+        </div>,
+        document.body
+      )}
       {(basketSlideInRow != null || basketShowingFinal) && (
         <div
           style={{

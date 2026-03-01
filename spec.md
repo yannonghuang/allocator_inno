@@ -38,13 +38,13 @@ bom(BOM_ID,PARENT_ID,CHILD_ID,ELEM_IX,ALT_GROUP,RATE)
 
 customer(CUSTOMER,DESCRIPTION)
 
-demand(ID,DESCRIPTION,CUSTOMER_ID,PRIORITY,REQUEST_DUE_TIME,PRODUCT_ID,QUANTITY)
+demand(ID,DESCRIPTION,CUSTOMER_ID,PRIORITY,REQUEST_DUE_TIME,PRODUCT_ID,QUANTITY): smaller number= higher PRIORITY 
 
 location(LOCATION_ID,LOCATION_DESCRIPTION)
 
-method_buy(PRODUCT_ID,LOCATION_ID,PREFERENCE,LEAD_DAYS_SUPPLY,CYCLE_DAYS_SUPPLY,VENDOR_ID)
+method_buy(PRODUCT_ID,LOCATION_ID,PREFERENCE,LEAD_DAYS_SUPPLY,CYCLE_DAYS_SUPPLY,VENDOR_ID): smaller number= higher PREFERENCE
 
-method_make(BOM_ID,PRODUCT_ID,LOCATION_ID,PREFERENCE)
+method_make(BOM_ID,PRODUCT_ID,LOCATION_ID,PREFERENCE): smaller number= higher PREFERENCE
 
 product(PRODUCT_ID,DESCRIPTION)
 
@@ -52,7 +52,7 @@ productlocation(PRODUCT_ID,DESCRIPTION,LOCATION_ID,MAX_LOT_SIZE,PROD_AREA)
 
 supply(SUPPLY_ID,DESCRIPTION,VENDOR_ID,LOCATION_ID,PRODUCT_ID,SUPPLY_DATE,QTY)
 
-method_move(PRODUCT_ID,FROM_LOCATION_ID,TO_LOCATION_ID,TRANSIT_TIME,TRANSIT_TIME_UOM,PREFERENCE)
+method_move(PRODUCT_ID,FROM_LOCATION_ID,TO_LOCATION_ID,TRANSIT_TIME,TRANSIT_TIME_UOM,PREFERENCE): smaller number= higher PREFERENCE
 (a.k.a. transportation())
 
 vendor(VENDOR_ID)
@@ -202,6 +202,56 @@ for component in scarcity_order(basket_prod):
             add target to basket_prod
             prune basket_prod of resources unrelated to remaining production targets
 
+---------------------------------------
+planning algorithm (from demand to supply)
+---------------------------------------
+Implementation: backend/app/services/planning_engine.py. Entry: run_planning(data); API: POST /cases/{id}/plan.
+
+Data models (as implemented):
+  work_order: product_id, location_id, quantity, start_time, end_time, method (make|move|purchase), location_source (if move), demand_id, prod_area (from productlocation)
+  committed_demand: demand_id, customer_id, customer, product_id, location_id, quantity, request_time, commit_time, commit_reason (if soft fail)
+  demand (input): demand_id, customer_id, customer, product_id, location_id, quantity, request_due_time, priority
+
+get_methods(product_id, location_id, data):
+  Return all methods that can fulfill (product, location): method_buy, method_make, method_move.
+  Match on PRODUCT_ID and LOCATION_ID (or TO_LOCATION_ID for move). When location is VIRTUAL or empty,
+  also match make/buy by product_id only so demand at VIRTUAL can be planned via production at physical locations.
+
+get_preferred_method(methods):
+  Implemented as preference-only (no recursive scoring): choose method with smallest preference number.
+  Returns (chosen_method, explanation). Spec originally allowed score = earliest commit + most consumed + least buy + preference;
+  full scoring was removed to avoid blow-up when many methods/levels exist.
+
+get_preferred_variants(variants, inventory, data, req_dt, lead_days, planning_path, depth, demand_net_qty, multiple=None):
+  Variants = list of (alt_group_key, child_materials) from _variants_for_make (BOM grouped by ALT_GROUP).
+  - multiple is False: return one best variant. Score each variant by running plan() for its children on a copy of inventory;
+    sort by (earliest max_commit_time, most inventory_consumed, least purchase_qty). Return [(chosen_child_materials, chosen_alt_key, demand_net_qty)], explanation.
+  - multiple is None (default): return all feasible variants (planning did not fail), with demand_net_qty divided equally.
+    When demand quantity is integer, per-variant quantities kept integer (base + remainder spread). Each item = (scaled_child_materials, alt_key, qty).
+  Failed variants (any child with commit_reason not in {cycle_stopped, cycle_detected}) sort last.
+  Returns (list of (child_materials, alt_key, quantity), explanation).
+
+get_preferred_variant(...):
+  Wrapper: get_preferred_variants(..., multiple=False); returns (child_materials, chosen_alt_key, explanation).
+
+ALT_GROUP (BOM) clarification:
+  - Group BOM rows by ALT_GROUP (same BOM_ID, PARENT_ID). Null/empty ALT_GROUP → one group (e.g. "__null__").
+  - Within each group: all children required (AND). Each group = one requirement set (variant).
+  - Across groups: alternatives (OR). _variants_for_make builds list of (alt_group_key, child_materials).
+  - Example: x = {product_a, product_b}, y = {product_c, product_d}, z = {product_e, product_f} (null) → choose one of x, y, z.
+
+plan(demand, inventory, data, request_time_dt, depth, planning_path):
+  Returns (committed_demands_list, work_orders_list, pegging_tree_node).
+  - Fulfill from inventory (FIFO); demand_fulfilled gets commit_time from supply or request_time. demand_net = quantity - taken.
+  - methods = get_methods(...). m, explanation = get_preferred_method(methods). Production location from method (or to_location_id for move).
+  - Child materials: make → get_preferred_variants(..., multiple=None), flatten child_materials; move → one child at from_location; purchase → none.
+  - Recursively plan each child; if any child fails (commit_reason not in {cycle_stopped, cycle_detected}), return with commit_reason "child_failed:...".
+  - start_time = max(request_time - lead_days, latest child commit_times); batch by MAX_LOT_SIZE from productlocation; emit work_orders with prod_area.
+  - Cycle: (product_id, location_id) in planning_path → return commit_reason "cycle_stopped" (benign). Depth <= 0 → "depth_limit". All set commit_time.
+  - Pegging tree: root type=demand; children = supply nodes + work_order nodes (with method_choice_explanation, variant_choice_explanation).
+
+run_planning(data):
+  Inventory = supply buckets. Demands sorted by priority, demand_id. For each d: solved, wos, pegging = plan(d, ...); extend committed_demands and work_orders; append { demand_id, tree } to planning_pegging. Return { committed_demands, work_orders, planning_pegging }.
 
 ---------------------------------------
 "critical path" 
@@ -223,6 +273,7 @@ UI views
 UI should support the following views:
 - Supply view: initial/residual quantities
 - Allocation view: how a supply (raw/intermediary materials) to allocated to demands (intermediary/FG demand materials)
-- Suggested revised demands
+- Demand view (suggested revised demands): fulfillment by demand, with customer and rollup by customer
+- Planning (separate section): Run plan → Committed demands table (customer, commit_time, commit_reason, pegging) and Work orders table (prod_area, method, pegging). Each table in a tab with sticky headers and rollup (by customer, by PROD_AREA). Planning pegging slide-in shows tree (demand → work orders → supply/purchase) with method/variant explanations. **Planning copilot**: slide-in chat panel to configure `get_preferred_variants()`; users express requirements in natural language; the system uses an LLM (when OPENAI_API_KEY is set) to parse intents and may ask follow-up questions for clarification; fallback rule-based parsing when LLM is unavailable; config is sent in POST body when running plan.
 
-Each views should be equipped with sort/filter
+Each view should be equipped with sort/filter.

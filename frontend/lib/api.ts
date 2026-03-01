@@ -3,7 +3,7 @@ const API = typeof window !== 'undefined' ? '/api' : 'http://localhost:8000';
 export type Case = { id: number; name: string; created_at: string; demand_count?: number; supply_count?: number; run_count?: number };
 export type AllocationRun = { id: number; case_id: number; created_at: string; status: string; config?: Record<string, unknown> };
 export type AllocationAction = { id: number; run_id: number; variant_key: string; req_component_ids: string[]; qty: number; demand_id?: string; target_product_id?: string; target_location_id?: string };
-export type FeasibleDemand = { demand_id: string; product_id: string; requested_qty: number; allocated_qty: number; fulfillment_rate?: number | null; status: string; suggested_revision?: string; request_due_time?: string | null; revised_time?: string | null };
+export type FeasibleDemand = { demand_id: string; customer_id?: string | null; customer?: string | null; product_id: string; requested_qty: number; allocated_qty: number; fulfillment_rate?: number | null; status: string; suggested_revision?: string; request_due_time?: string | null; revised_time?: string | null };
 export type SupplyViewRow = { id?: number; component_key: string; supply_id: string; supply_date?: string | null; product_id: string; location_id: string; initial_qty: number; consumed_qty: number; residual_qty: number; utilization_rate?: number | null };
 export type AllocationViewCandidate = {
   to_inventory_id: string;
@@ -159,6 +159,77 @@ function fetchWithTimeout(url: string, options?: RequestInit, timeoutMs = FETCH_
 
 export async function getFeasibleDemands(caseId: number, runId: number): Promise<{ feasible_demands: FeasibleDemand[] }> {
   const r = await fetchWithTimeout(`${API}/cases/${caseId}/runs/${runId}/feasible-demands`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Demand-to-supply planning: returns committed demands (with commit_time), work orders, and planning pegging trees. */
+export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; request_time?: string | null; commit_time: string | null; commit_reason?: string | null };
+export type WorkOrder = { product_id: string; location_id: string; quantity: number; start_time: string | null; end_time: string | null; method: string; location_source?: string | null; demand_id?: string | null; prod_area?: string | null };
+
+/** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
+export type PlanningPeggingNode = {
+  type: 'demand' | 'work_order' | 'supply' | 'purchase';
+  demand_id?: string | null;
+  product_id?: string;
+  location_id?: string;
+  quantity?: number;
+  request_time?: string | null;
+  commit_time?: string | null;
+  commit_reason?: string | null;
+  start_time?: string | null;
+  end_time?: string | null;
+  method?: string;
+  location_source?: string | null;
+  /** Why this method was chosen when multiple alternatives exist. */
+  method_choice_explanation?: string | null;
+  /** Why this BOM/variant was chosen when multiple ALT_GROUP variants exist (make only). */
+  variant_choice_explanation?: string | null;
+  children: PlanningPeggingNode[];
+};
+
+export type PlanningPeggingEntry = { demand_id: string; tree: PlanningPeggingNode };
+
+/** Config for planning (e.g. get_preferred_variants). Sent in POST body to /plan. */
+export type PlanningConfig = {
+  variant_selection?: {
+    multiple?: boolean | null;
+    /** Split demand among only the top N variants (by score). E.g. 2 = "top 2 variants". */
+    top_n?: number;
+    /** Weights for scoring (normalized to sum to 1): commit_time, inventory_consumed, purchase. Dynamic from user intent. */
+    score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
+  };
+};
+
+export async function runPlan(
+  caseId: number,
+  config?: PlanningConfig | null
+): Promise<{ committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] }> {
+  const body = config ? { config } : undefined;
+  const r = await fetchWithTimeout(`${API}/cases/${caseId}/plan`, {
+    method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type PlanningCopilotMessage = { role: 'user' | 'assistant'; text: string };
+
+export type PlanningCopilotResponse = { reply: string; config_update: PlanningConfig | null };
+
+export async function planningCopilot(
+  caseId: number,
+  message: string,
+  currentConfig: PlanningConfig,
+  history: PlanningCopilotMessage[]
+): Promise<PlanningCopilotResponse> {
+  const r = await fetch(`${API}/cases/${caseId}/planning-copilot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, current_config: currentConfig, history }),
+  });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

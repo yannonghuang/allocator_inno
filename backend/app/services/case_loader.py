@@ -40,6 +40,7 @@ def load_case_data(db: Session, case_id: int) -> dict[str, Any]:
     vendors = db.query(Vendor).filter(Vendor.case_id == case_id).all()
     overrides = db.query(ManualOverride).filter(ManualOverride.case_id == case_id).all()
 
+    cust_by_id = {r.customer: (r.description or r.customer) for r in customers}
     return {
         "bom": [{"bom_id": r.bom_id, "parent_id": r.parent_id, "child_id": r.child_id, "rate": r.rate or 0, "alt_group": getattr(r, "alt_group", None)} for r in boms],
         "customer": [{"customer": r.customer, "description": r.description} for r in customers],
@@ -48,6 +49,7 @@ def load_case_data(db: Session, case_id: int) -> dict[str, Any]:
                 "demand_id": r.demand_id,
                 "description": r.description,
                 "customer_id": r.customer_id,
+                "customer": cust_by_id.get(r.customer_id, r.customer_id),
                 "priority": r.priority or 0,
                 "request_due_time": r.request_due_time,
                 "product_id": r.product_id,
