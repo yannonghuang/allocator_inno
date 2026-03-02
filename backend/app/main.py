@@ -1,7 +1,21 @@
+import logging
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import engine, Base
+
+# Ensure app loggers (e.g. planning_engine multi-method / multi-variant) show in Docker/uvicorn stdout
+_app_log = logging.getLogger("app")
+_app_log.setLevel(logging.INFO)
+if not _app_log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setLevel(logging.INFO)
+    _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    _app_log.addHandler(_h)
+    _app_log.propagate = False  # we handle it here so it appears in Docker stdout
+_app_log.info("App logging configured (multi-method / multi-variant will log here)")
 from app.api.cases import router as cases_router
 from app.api.allocate import router as allocate_router
 from app.api.overrides import router as overrides_router

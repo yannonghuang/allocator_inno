@@ -194,23 +194,54 @@ export type PlanningPeggingEntry = { demand_id: string; tree: PlanningPeggingNod
 export type PlanningConfig = {
   variant_selection?: {
     multiple?: boolean | null;
-    /** Split demand among only the top N variants (by score). E.g. 2 = "top 2 variants". */
     top_n?: number;
-    /** Weights for scoring (normalized to sum to 1): commit_time, inventory_consumed, purchase. Dynamic from user intent. */
     score_weights?: { commit_time?: number; inventory_consumed?: number; purchase?: number };
   };
+  /** When true, score methods by commit_time/inventory/purchase (slower; run is async with progress). */
+  method_selection?: { elaborate?: boolean; multiple?: boolean };
 };
+
+export type PlanResult = { committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] };
 
 export async function runPlan(
   caseId: number,
   config?: PlanningConfig | null
-): Promise<{ committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] }> {
-  const body = config ? { config } : undefined;
+): Promise<PlanResult> {
+  const body = JSON.stringify({ config: config ?? undefined, async: false });
   const r = await fetchWithTimeout(`${API}/cases/${caseId}/plan`, {
     method: 'POST',
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    headers: { 'Content-Type': 'application/json' },
+    body,
   });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Start async plan; returns job_id. Poll getPlanStatus(caseId, job_id) for progress and result. */
+export async function runPlanAsync(caseId: number, config?: PlanningConfig | null): Promise<{ job_id: string }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: config ?? undefined, async: true }),
+  });
+  if (r.status !== 202) {
+    const text = await r.text();
+    throw new Error(r.ok ? text : `Plan start failed: ${text}`);
+  }
+  const data = await r.json();
+  if (!data?.job_id) throw new Error('No job_id in response');
+  return { job_id: data.job_id };
+}
+
+export type PlanStatusResponse = {
+  status: 'running' | 'completed' | 'failed';
+  progress?: { current: number; total: number };
+  result?: PlanResult;
+  error?: string;
+};
+
+export async function getPlanStatus(caseId: number, jobId: string): Promise<PlanStatusResponse> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/status/${jobId}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

@@ -222,6 +222,16 @@ get_preferred_method(methods):
   Returns (chosen_method, explanation). Spec originally allowed score = earliest commit + most consumed + least buy + preference;
   full scoring was removed to avoid blow-up when many methods/levels exist.
 
+Optimizations (trivial cases): When only one method exists, plan() uses it without calling get_preferred_method or elaborate. When only one variant exists, get_preferred_variants returns it without scoring. When equal split is used with no top_n (all feasible variants), variant scoring skips weighted score and sort—only feasibility is needed.
+
+method_selection.multiple (optional): When true and multiple methods (make/move/buy) can fulfill a demand, demand is split equally across those methods (integer split when demand quantity is integer). Same policy as variant equal split. When false or omitted, one method is chosen (by preference or by elaborate score).
+
+get_preferred_method_elaborate (optional, config.method_selection.elaborate = true):
+  Default: elaborate is off; method choice uses get_preferred_method (preference-only). When elaborate is on,
+  each method is scored by simulating one level of plan() (limited depth) and aggregating commit_time, inventory_consumed, purchase.
+  Policy: uses the same score_weights as variant_selection (commit_time, inventory_consumed, purchase). So configuring variant
+  weights via the copilot also configures elaborate method selection when it is enabled. Only applied at top level to avoid slow runs. Ignored when method_selection.multiple is true (equal split across methods).
+
 get_preferred_variants(variants, inventory, data, req_dt, lead_days, planning_path, depth, demand_net_qty, multiple=None):
   Variants = list of (alt_group_key, child_materials) from _variants_for_make (BOM grouped by ALT_GROUP).
   - multiple is False: return one best variant. Score each variant by running plan() for its children on a copy of inventory;

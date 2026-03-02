@@ -51,6 +51,13 @@ def _rule_based_parse(message: str, current_config: ConfigDict) -> tuple[str, Co
                 parts.append("ranked by **earliest commit time**")
             elif any(sw.get(k) for k in ("commit_time", "inventory_consumed", "purchase")):
                 parts.append("with custom **score weights**")
+        ms = current_config.get("method_selection") or {}
+        if ms.get("multiple") is True:
+            parts.append("**method equal split** (demand divided across all feasible methods)")
+        elif ms.get("elaborate") is True:
+            parts.append("**elaborate method selection** (methods scored by commit/inventory/purchase, same weights as variants)")
+        else:
+            parts.append("**simple method selection** (methods by preference only)")
         desc = ", ".join(parts) if parts else "default"
         return (
             f"Right now we’re using {desc}. If you’d like to switch, just say so—e.g. “use single variant” or “split across all”.",
@@ -97,6 +104,17 @@ def _rule_based_parse(message: str, current_config: ConfigDict) -> tuple[str, Co
             {"variant_selection": {**vs, "multiple": False, "score_weights": {"commit_time": 0, "inventory_consumed": 1, "purchase": 0}}},
         )
 
+    # Earliest commit time / fastest = single best with full weight on commit_time
+    if re.search(
+        r"earliest commit|earliest (delivery|fulfillment|time)|fastest|select.*(alternative|option|variant).*earliest|"
+        r"prefer.*earliest|commit time.*(earliest|first)|minim(ize|ise) (commit )?time",
+        t,
+    ):
+        return (
+            "Using **single best** with **earliest commit time** as the only criterion—the planner will pick the alternative (variant or method when scored) that commits soonest. Re-run plan to apply.",
+            {"variant_selection": {**vs, "multiple": False, "score_weights": {"commit_time": 1, "inventory_consumed": 0, "purchase": 0}}},
+        )
+
     if re.search(r"single|one variant|only one|best variant|use one", t):
         return (
             "Got it—I’ll use **single best variant**. The planner will pick one option per demand using earliest commit, "
@@ -104,17 +122,46 @@ def _rule_based_parse(message: str, current_config: ConfigDict) -> tuple[str, Co
             {"variant_selection": {**vs, "multiple": False}},
         )
 
-    if re.search(r"all variants|split|multiple variants|every variant|equal split|divide (across|among)", t):
+    if re.search(
+        r"all variants|split|multiple variants|every variant|equal split|divide (across|among)|"
+        r"equally distribute|distribute equally|(demand )?among multiple alternatives|multiple alternatives.*(equal|distribute)|"
+        r"equal(ly)? (split|distribute)|alternatives if present|treat multiple alternatives equally|workload",
+        t,
+    ):
         return (
-            "Using **all feasible variants** with an equal split—demand is divided across every feasible option "
-            "(integer quantities when demand is integer). Re-run plan to apply.",
-            {"variant_selection": {**vs, "multiple": True}},
+            "Treating multiple alternatives equally for **variants** and **methods**: variants use an equal split across all feasible options (integer quantities when demand is integer); "
+            "methods use an equal split across all feasible methods (make/move/buy) when multiple can fulfill a demand. Re-run plan to apply.",
+            {"variant_selection": {**vs, "multiple": True}, "method_selection": {**(current_config.get("method_selection") or {}), "multiple": True}},
         )
 
     if re.search(r"reset|default|clear", t):
         return (
             "Reset to default: **all feasible variants** (equal split). Re-run plan to apply.",
             {"variant_selection": {"multiple": True}},
+        )
+
+    # Method selection: elaborate (score by commit/inventory/purchase) vs simple (preference only)
+    ms = current_config.get("method_selection") or {}
+    if re.search(
+        r"elaborate method|score methods?|method selection.*score|methods? by (commit|inventory|purchase)|"
+        r"turn on elaborate|use elaborate method|enable elaborate",
+        t,
+    ):
+        return (
+            "Turning on **elaborate method selection**. Methods (make/move/buy) will be scored by the same criteria as variants: "
+            "earliest commit time, most inventory consumed, least new purchase—using the same score weights you set for variant selection. "
+            "Re-run plan to apply (this mode is slower).",
+            {"method_selection": {**ms, "elaborate": True}},
+        )
+    if re.search(
+        r"simple method|preference only|methods? by preference|turn off elaborate|disable elaborate|"
+        r"use simple method|prefer methods? by preference",
+        t,
+    ):
+        return (
+            "Using **simple method selection** (preference only). The planner will pick make/move/buy by the preference number only, "
+            "not by scoring. Re-run plan to apply.",
+            {"method_selection": {**ms, "elaborate": False}},
         )
 
     return (
@@ -136,18 +183,39 @@ def _llm_parse(message: str, current_config: ConfigDict, history: list[dict]) ->
         logger.info("Planning copilot: OPENAI_API_KEY not set on backend, using rule-based fallback. Set OPENAI_API_KEY in the backend environment (e.g. in docker-compose for the backend service) to enable the LLM.")
         return None
     client = openai.OpenAI(api_key=api_key)
-    system = """You are a friendly planning configuration assistant. You help users configure how the planning engine chooses BOM/variants when multiple alternatives exist. Be conversational and natural—not robotic or rigid. Acknowledge what they said and respond in a warm, helpful way.
+    system = """You are a friendly planning configuration assistant. Users express their requirements in many different ways. Your job is to infer their intent from whatever wording they use—do not expect or require specific phrases. Be conversational and natural.
 
-What the system supports:
-- variant_selection.multiple: false = single best variant; true or omitted = split demand across variants.
-- variant_selection.top_n: optional number (e.g. 2). When set with split mode, use only the top N variants (by score_weights), and split demand equally among those N. So "split among top 2 variants that use the least additional supplies" => multiple: true, top_n: 2, score_weights: {"purchase": 1, "commit_time": 0, "inventory_consumed": 0}.
-- variant_selection.score_weights: optional { "commit_time", "inventory_consumed", "purchase" } — numbers that are normalized to sum to 1. They control how we rank variants: **weights are not fixed; they are set dynamically from the user's request.** Default is balanced (commit_time ~0.4, inventory_consumed ~0.35, purchase ~0.25). If the user says "use the most existing inventories" or "prioritize existing inventory", they mean: **change the weight distribution** so that inventory consumption gets more, most, or all of the weight — **at the expense of fulfillment time** (commit_time weight goes down). Set score_weights to e.g. {"commit_time": 0, "inventory_consumed": 1, "purchase": 0}. For "earliest delivery" or "fastest", put weight on commit_time. For "minimize new purchases", "minimum additional supplies", "least additional supply", put weight on purchase: score_weights {"commit_time": 0, "inventory_consumed": 0, "purchase": 1}. When the user says "split among top 2" (or top N) "variants that use the least additional supplies", set multiple: true, top_n: 2 (or N), and score_weights for purchase so we split demand among the top N variants ranked by least purchase.
+Intent → config mapping (interpret any phrasing that conveys the same intent). The same policy applies to both **variants** (BOM/recipe alternatives) and **methods** (make/move/buy): when the user wants to treat multiple alternatives equally, apply to both.
 
-Respond with valid JSON only, no markdown code fences. Two keys:
-- "reply": string (required). Your reply. Sound human: acknowledge their intent, explain that you're changing the weight distribution (or variant mode) and what that means (e.g. "inventory gets all the weight, so we prefer options that use the most existing stock; fulfillment may be later"). Mention re-run plan if you changed something.
-- "config_update": object (optional). Include when the user clearly wants a change. Use {"variant_selection": {"multiple": false, "score_weights": {...}}} or similar. For "use the most existing inventories" use score_weights: {"commit_time": 0, "inventory_consumed": 1, "purchase": 0}.
+1) **Treat multiple alternatives equally / split demand across options / distribute workload / use all options when multiple exist** (for both variants and methods)
+   → variant_selection: { "multiple": true }, method_selection: { "multiple": true }. (Variants: demand split equally across all feasible variants; integer qty when demand is integer. Methods: demand split equally across all feasible methods make/move/buy.)
+   In your reply, say you're applying equal split to **both** variants and methods.
 
-Never give a stiff list of exact phrases; respond naturally."""
+2) **Use only one best option per demand** (e.g. single best variant, pick one, prefer one)
+   → variant_selection: { "multiple": false }. (Engine picks one by: earliest commit, most inventory used, least purchase.)
+
+3) **Prioritize existing inventory / use what we have / consume more stock** (even if delivery is later)
+   → variant_selection: { "multiple": false, "score_weights": { "commit_time": 0, "inventory_consumed": 1, "purchase": 0 } }.
+
+4) **Minimize new purchases / least additional supply / avoid new buy**
+   → variant_selection: { "multiple": false, "score_weights": { "commit_time": 0, "inventory_consumed": 0, "purchase": 1 } }.
+
+5) **Earliest delivery / fastest commit**
+   → variant_selection: { "multiple": false, "score_weights": { "commit_time": 1, "inventory_consumed": 0, "purchase": 0 } }.
+
+6) **Split among top N variants** (e.g. top 2, top 3), optionally **by least supply / by inventory**
+   → variant_selection: { "multiple": true, "top_n": N }. Add "score_weights" only if they specify a criterion (e.g. least supply => purchase: 1).
+
+7) **Score methods (make/move/buy) by same criteria as variants** (slower run)
+   → method_selection: { "elaborate": true }. **Use preference only for methods** → method_selection: { "elaborate": false }.
+
+Valid config_update keys: variant_selection (object with optional multiple, top_n, score_weights), method_selection (object with optional elaborate, multiple). score_weights: optional { "commit_time", "inventory_consumed", "purchase" } (numbers, normalized to sum 1).
+
+Respond with valid JSON only, no markdown code fences:
+- "reply": string (required). Acknowledge their intent in their words and say what you set. Mention re-run plan if you changed config.
+- "config_update": object (optional). Include when you inferred a clear intent. Merge intent with current config where sensible (e.g. set only the keys that change).
+
+Interpret freely: e.g. "equally distribute among alternatives if present", "treat multiple alternatives equally", "handle workload", "when there are multiple ways do X", "split across options", "use all options" → all map to (1). Always mention both variants and methods in your reply for (1). Never say you only handle specific phrases."""
     messages = [{"role": "system", "content": system}]
     messages.append({"role": "user", "content": f"Current config: {json.dumps(current_config)}"})
     for h in history[-10:]:
@@ -168,10 +236,15 @@ Never give a stiff list of exact phrases; respond naturally."""
         data = json.loads(text)
         reply = data.get("reply") or "I didn’t quite get that. I can set **single best variant** (earliest commit, use more existing inventory, less new purchase) or **split** demand across all feasible variants—which do you prefer?"
         config_update = data.get("config_update")
-        if isinstance(config_update, dict) and "variant_selection" in config_update:
-            vs_up = config_update["variant_selection"]
-            if isinstance(vs_up, dict) and ("multiple" in vs_up or "score_weights" in vs_up or "top_n" in vs_up):
-                return (reply, config_update)
+        if isinstance(config_update, dict):
+            if "variant_selection" in config_update:
+                vs_up = config_update["variant_selection"]
+                if isinstance(vs_up, dict) and ("multiple" in vs_up or "score_weights" in vs_up or "top_n" in vs_up):
+                    return (reply, config_update)
+            if "method_selection" in config_update:
+                ms_up = config_update["method_selection"]
+                if isinstance(ms_up, dict) and ("elaborate" in ms_up or "multiple" in ms_up):
+                    return (reply, config_update)
         return (reply, None)
     except Exception as e:
         logger.warning("Planning copilot: LLM call failed (%s), using rule-based fallback", e)

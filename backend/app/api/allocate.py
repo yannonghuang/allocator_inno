@@ -1,6 +1,9 @@
+import threading
+import uuid
 from typing import Any, List
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, get_db
@@ -13,6 +16,10 @@ from app.services.planning_copilot import planning_copilot_reply
 from app.services.time_utils import build_period_index, demand_due_period, period_to_date
 
 router = APIRouter(tags=["Allocation"])
+
+# In-memory store for async plan jobs: job_id -> { case_id, status, progress, result, error }
+_plan_jobs: dict[str, dict] = {}
+_plan_jobs_lock = threading.Lock()
 
 
 def _run_allocation_background(case_id: int, run_id: int) -> None:
@@ -273,12 +280,70 @@ def get_feasible_demands(case_id: int, run_id: int, db: Session = Depends(get_db
     return {"feasible_demands": feasible}
 
 
-@router.post("/cases/{case_id}/plan", response_model=dict)
-def run_plan(case_id: int, db: Session = Depends(get_db), body: dict | None = Body(None)):
+def _run_planning_background(job_id: str, case_id: int, config: Any) -> None:
+    """Run planning in background; update _plan_jobs with progress and result."""
+    db = SessionLocal()
+    try:
+        data = load_case_data(db, case_id)
+        if not data.get("demand") or not data.get("supply"):
+            with _plan_jobs_lock:
+                _plan_jobs[job_id]["status"] = "failed"
+                _plan_jobs[job_id]["error"] = "No demand or supply data"
+            return
+
+        def progress_cb(progress: dict) -> None:
+            with _plan_jobs_lock:
+                if job_id in _plan_jobs and _plan_jobs[job_id]["status"] == "running":
+                    _plan_jobs[job_id]["progress"] = dict(progress)
+
+        result = run_planning(data, config=config, progress_callback=progress_cb)
+        with _plan_jobs_lock:
+            if job_id in _plan_jobs:
+                _plan_jobs[job_id]["status"] = "completed"
+                _plan_jobs[job_id]["result"] = result
+                _plan_jobs[job_id]["progress"] = {"current": result["committed_demands"] and len(result["committed_demands"]) or 0, "total": result["committed_demands"] and len(result["committed_demands"]) or 0}
+    except Exception as e:
+        with _plan_jobs_lock:
+            if job_id in _plan_jobs:
+                _plan_jobs[job_id]["status"] = "failed"
+                _plan_jobs[job_id]["error"] = str(e)
+    finally:
+        db.close()
+
+
+@router.get("/cases/{case_id}/plan/status/{job_id}", response_model=dict)
+def get_plan_status(case_id: int, job_id: str):
+    """Poll for async plan job status. Returns { status, progress?: { current, total }, result?, error? }."""
+    with _plan_jobs_lock:
+        job = _plan_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Plan job not found")
+    if job.get("case_id") != case_id:
+        raise HTTPException(status_code=404, detail="Plan job not found for this case")
+    out = {"status": job["status"], "progress": job.get("progress")}
+    if job.get("result") is not None:
+        out["result"] = job["result"]
+    if job.get("error") is not None:
+        out["error"] = job["error"]
+    return out
+
+
+def _start_plan_background(job_id: str, case_id: int, config: Any) -> None:
+    """Start planning in a daemon thread so we don't need BackgroundTasks (avoids FastAPI response_model issue)."""
+    t = threading.Thread(target=_run_planning_background, args=(job_id, case_id, config), daemon=True)
+    t.start()
+
+
+@router.post("/cases/{case_id}/plan", response_model=None)
+def run_plan(
+    case_id: int,
+    db: Session = Depends(get_db),
+    body: dict | None = Body(None),
+) -> Any:
     """
-    Demand-to-supply planning: takes case demands and supplies, returns committed demands
-    (with commit_time per quantity) and planned work orders.
-    Optional body: { "config": { "variant_selection": { "multiple": false } } } to use single best variant; omit for all feasible.
+    Demand-to-supply planning. Body: { "config": {...}, "async": true }.
+    If async is true: returns 202 with job_id; poll GET /cases/{case_id}/plan/status/{job_id} for progress and result.
+    If async is false or omitted: runs synchronously and returns the result.
     """
     c = db.query(Case).filter(Case.id == case_id).first()
     if not c:
@@ -288,9 +353,28 @@ def run_plan(case_id: int, db: Session = Depends(get_db), body: dict | None = Bo
         raise HTTPException(status_code=400, detail="No demand data")
     if not data.get("supply"):
         raise HTTPException(status_code=400, detail="No supply data")
-    config = (body or {}).get("config")
-    result = run_planning(data, config=config)
-    return result
+    payload = body or {}
+    config = payload.get("config")
+    use_async = payload.get("async") is True
+
+    if use_async:
+        job_id = str(uuid.uuid4())
+        with _plan_jobs_lock:
+            _plan_jobs[job_id] = {
+                "case_id": case_id,
+                "status": "running",
+                "progress": {"current": 0, "total": len(data.get("demand") or [])},
+                "result": None,
+                "error": None,
+            }
+        _start_plan_background(job_id, case_id, config)
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job_id, "status": "running", "message": "Poll GET /cases/{case_id}/plan/status/{job_id} for progress and result."},
+            headers={"Location": f"/cases/{case_id}/plan/status/{job_id}"},
+        )
+
+    return run_planning(data, config=config)
 
 
 @router.post("/cases/{case_id}/planning-copilot", response_model=dict)

@@ -20,6 +20,8 @@ import {
   getAllocationViewBasket,
   getAllocationActions,
   runPlan,
+  runPlanAsync,
+  getPlanStatus,
   planningCopilot,
   type PlanningConfig,
   type PlanningCopilotMessage,
@@ -95,6 +97,9 @@ export default function CaseDetail() {
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders'>('demands');
   const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({});
+  const [planJobId, setPlanJobId] = useState<string | null>(null);
+  const [planProgress, setPlanProgress] = useState<{ current: number; total: number } | null>(null);
+  const planPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [copilotMessages, setCopilotMessages] = useState<PlanningCopilotMessage[]>([]);
   const [copilotInput, setCopilotInput] = useState('');
@@ -104,13 +109,13 @@ export default function CaseDetail() {
   const [copilotResizing, setCopilotResizing] = useState(false);
   const copilotMessagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  /** Rule-based intent: map user message to config updates and a reply for get_preferred_variants() behavior. */
+  /** Rule-based intent: map user message to config updates and a reply for variant and method selection. */
   function parseCopilotIntent(message: string, currentConfig: PlanningConfig): { reply: string; configUpdate?: PlanningConfig } {
     const t = message.trim().toLowerCase();
     const vs = currentConfig.variant_selection ?? {};
     const multi = vs.multiple;
 
-    if (!t) return { reply: 'You can ask to use a single best variant, or to split demand across all feasible variants. Say "show config" to see current settings.' };
+    if (!t) return { reply: 'You can ask to use a single best variant or split across all feasible variants; or to use one method by preference/score or equal split across methods. Say "show config" to see current settings.' };
 
     if (/show|current|what('s| is)? (my )?config|settings|config/.test(t)) {
       const mode = multi === false ? 'single best variant' : 'all feasible variants (equal split)';
@@ -139,13 +144,55 @@ export default function CaseDetail() {
     }
 
     return {
-      reply: 'I only handle variant selection for planning. Try: "use single variant", "split across all variants", or "show config".',
+      reply: 'I handle variant and method selection for planning. Try: "use single variant", "split across all variants", "equal split across methods", or "show config".',
     };
   }
 
   useEffect(() => {
     copilotMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [copilotMessages]);
+
+  useEffect(() => {
+    if (!planJobId || id == null) return;
+    const poll = async () => {
+      try {
+        const st = await getPlanStatus(id, planJobId);
+        if (st.progress) setPlanProgress(st.progress);
+        if (st.status === 'completed' && st.result) {
+          setPlanResult(st.result);
+          setPlanJobId(null);
+          setPlanLoading(false);
+          setPlanProgress(null);
+          setPlanError(null);
+          if (planPollRef.current) {
+            clearInterval(planPollRef.current);
+            planPollRef.current = null;
+          }
+          return;
+        }
+        if (st.status === 'failed') {
+          setPlanError(st.error ?? 'Plan failed');
+          setPlanJobId(null);
+          setPlanLoading(false);
+          setPlanProgress(null);
+          if (planPollRef.current) {
+            clearInterval(planPollRef.current);
+            planPollRef.current = null;
+          }
+        }
+      } catch {
+        // keep polling on transient errors
+      }
+    };
+    poll();
+    planPollRef.current = setInterval(poll, 1500);
+    return () => {
+      if (planPollRef.current) {
+        clearInterval(planPollRef.current);
+        planPollRef.current = null;
+      }
+    };
+  }, [planJobId, id]);
 
   const basketInitialKeys = new Set(basketInitial.map((b) => b.key));
 
@@ -1354,16 +1401,45 @@ export default function CaseDetail() {
           Use <strong>Configure planning (copilot)</strong> to set how variants are chosen (single best vs. split across all).
         </p>
         <div style={{ marginBottom: '0.75rem' }}>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={planningConfig.method_selection?.multiple === true}
+              onChange={(e) => setPlanningConfig((c) => ({
+                ...c,
+                method_selection: { ...c.method_selection, multiple: e.target.checked },
+              }))}
+            />
+            <span>Equal split across methods (when multiple make/move/buy can fulfill a demand; can be slower—we plan each method branch)</span>
+          </label>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={planningConfig.method_selection?.elaborate === true}
+              onChange={(e) => setPlanningConfig((c) => ({
+                ...c,
+                method_selection: { ...c.method_selection, elaborate: e.target.checked },
+              }))}
+            />
+            <span>Use elaborate method selection (slower, scores by commit/inventory/purchase; ignored when equal split across methods is on)</span>
+          </label>
+          <br style={{ marginTop: '0.25rem' }} />
           <button
             type="button"
             disabled={planLoading}
-            onClick={() => {
+            onClick={async () => {
               setPlanError(null);
               setPlanLoading(true);
-              runPlan(id, Object.keys(planningConfig).length ? planningConfig : undefined)
-                .then(setPlanResult)
-                .catch((e) => setPlanError(e instanceof Error ? e.message : 'Plan failed'))
-                .finally(() => setPlanLoading(false));
+              setPlanProgress(null);
+              const config = Object.keys(planningConfig).length ? planningConfig : undefined;
+              try {
+                const { job_id } = await runPlanAsync(id, config);
+                setPlanJobId(job_id);
+                setPlanProgress({ current: 0, total: 1 });
+              } catch (e) {
+                setPlanError(e instanceof Error ? e.message : 'Plan failed');
+                setPlanLoading(false);
+              }
             }}
           >
             {planLoading ? 'Running plan…' : 'Run plan'}
@@ -1386,6 +1462,23 @@ export default function CaseDetail() {
             {copilotOpen ? 'Hide copilot' : 'Configure planning (copilot)'}
           </button>
         </div>
+        {planLoading && planProgress && planProgress.total > 0 && (
+          <div style={{ marginTop: '0.5rem', maxWidth: 400 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.25rem' }}>
+              <span>Planning: {planProgress.current} / {planProgress.total} demands</span>
+            </div>
+            <div style={{ height: 8, backgroundColor: '#27272a', borderRadius: 4, overflow: 'hidden' }}>
+              <div
+                style={{
+                  height: '100%',
+                  width: `${Math.min(100, 100 * planProgress.current / planProgress.total)}%`,
+                  backgroundColor: '#3b82f6',
+                  transition: 'width 0.2s ease',
+                }}
+              />
+            </div>
+          </div>
+        )}
         {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
         {planResult && !planLoading && (
           <>
@@ -1568,13 +1661,14 @@ export default function CaseDetail() {
                 <button type="button" onClick={() => setCopilotOpen(false)} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
               </div>
               <p style={{ margin: 0, fontSize: '0.8rem', color: '#a1a1aa' }}>
-                Variant selection: <strong>{planningConfig.variant_selection?.multiple === false ? 'single best' : 'all feasible (equal split)'}</strong>. Express your requirements in natural language; the system may ask follow-up questions to clarify.
+                <strong>Variants:</strong> {planningConfig.variant_selection?.multiple === false ? 'single best' : 'all feasible (equal split)'}.{' '}
+                <strong>Methods:</strong> {planningConfig.method_selection?.multiple === true ? 'equal split' : planningConfig.method_selection?.elaborate === true ? 'one by score (elaborate)' : 'one by preference'}. Express your requirements in natural language; the system may ask follow-up questions to clarify.
               </p>
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '1rem 1.25rem' }}>
               {copilotMessages.length === 0 && (
                 <p style={{ margin: 0, fontSize: '0.875rem', color: '#71717a' }}>
-                  Ask how to configure <code style={{ background: '#27272a', padding: '2px 6px', borderRadius: 4 }}>get_preferred_variants()</code>. Examples: &quot;use only one variant per demand&quot;, &quot;split demand across all feasible variants&quot;, &quot;show current config&quot;. With an LLM enabled, you can use natural language and the assistant may ask clarifying questions.
+                  Ask how to configure <strong>variant</strong> and <strong>method</strong> selection. Examples: &quot;use only one variant per demand&quot;, &quot;split demand across all feasible variants&quot;, &quot;equal split across methods&quot;, &quot;show current config&quot;. With an LLM enabled, you can use natural language and the assistant may ask clarifying questions.
                 </p>
               )}
               {copilotMessages.map((m, i) => (
@@ -1597,11 +1691,21 @@ export default function CaseDetail() {
                 setCopilotLoading(true);
                 try {
                   const res = await planningCopilot(id, text, planningConfig, copilotMessages);
-                  if (res.config_update) setPlanningConfig((prev) => ({ ...prev, ...res.config_update! }));
+                  if (res.config_update) setPlanningConfig((prev) => ({
+                    ...prev,
+                    ...res.config_update!,
+                    variant_selection: res.config_update!.variant_selection ? { ...prev.variant_selection, ...res.config_update!.variant_selection } : prev.variant_selection,
+                    method_selection: res.config_update!.method_selection ? { ...prev.method_selection, ...res.config_update!.method_selection } : prev.method_selection,
+                  }));
                   setCopilotMessages((prev) => [...prev, { role: 'assistant', text: res.reply }]);
                 } catch {
                   const { reply, configUpdate } = parseCopilotIntent(text, planningConfig);
-                  if (configUpdate) setPlanningConfig((prev) => ({ ...prev, ...configUpdate }));
+                  if (configUpdate) setPlanningConfig((prev) => ({
+                    ...prev,
+                    ...configUpdate,
+                    variant_selection: configUpdate.variant_selection ? { ...prev.variant_selection, ...configUpdate.variant_selection } : prev.variant_selection,
+                    method_selection: configUpdate.method_selection ? { ...prev.method_selection, ...configUpdate.method_selection } : prev.method_selection,
+                  }));
                   setCopilotMessages((prev) => [...prev, { role: 'assistant', text: reply }]);
                 } finally {
                   setCopilotLoading(false);
