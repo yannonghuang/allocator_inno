@@ -29,9 +29,13 @@ import {
   type WorkOrder,
   type PlanningPeggingNode,
   type PlanningPeggingEntry,
+  type PlanKpis,
   type AllocationActionRow,
   getAllocationExplanation,
   getPegging,
+  getBomRealPairs,
+  getMovesWithTransit,
+  getWorkOrderPegging,
   type Case as CaseType,
   type AllocationRun as RunType,
   type FeasibleDemand,
@@ -41,6 +45,163 @@ import {
   type AllocationExplanation,
   type AllocationProgress,
 } from '@/lib/api';
+
+/** True if the pegging tree has any make WO that the backend marked as involving a real (non-virtual) BOM link.
+ *  Fallback: if backend flag is missing, use BOM (parent, child) pairs from bomRealPairKeys. */
+function peggingTreeContainsRealMake(node: PlanningPeggingNode, bomRealPairKeys: Set<string>): boolean {
+  if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'make') {
+    if ((node as { children_relation?: string }).children_relation === 'and' || (node as { children_relation?: string }).children_relation === 'or') {
+      // Backend has explicitly recognized BOM links for this make; treat that as real.
+      return true;
+    }
+    const parentId = (node.product_id ?? '').trim();
+    if (parentId && bomRealPairKeys.size > 0) {
+      for (const child of node.children ?? []) {
+        const childId = (child.product_id ?? '').trim();
+        if (childId && bomRealPairKeys.has(`${parentId}|${childId}`)) return true;
+      }
+    }
+  }
+  for (const child of node.children ?? []) {
+    if (peggingTreeContainsRealMake(child, bomRealPairKeys)) return true;
+  }
+  return false;
+}
+
+/** True if the pegging tree has any work order with method 'purchase' (buy). */
+function peggingTreeContainsPurchase(node: PlanningPeggingNode): boolean {
+  if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'purchase') {
+    return true;
+  }
+  for (const child of node.children ?? []) {
+    if (peggingTreeContainsPurchase(child)) return true;
+  }
+  return false;
+}
+
+/** True if the pegging tree has any move WO whose (product_id, from_location, to_location) is in realMoveKeys (TRANSIT_TIME > 0). */
+function peggingTreeContainsRealMove(node: PlanningPeggingNode, realMoveKeys: Set<string>): boolean {
+  if (node.type === 'work_order' && (node.method ?? '').toLowerCase() === 'move') {
+    const productId = (node.product_id ?? '').trim();
+    const toId = (node.location_id ?? '').trim();
+    const fromId = (node.location_source ?? '').trim();
+    if (productId && realMoveKeys.has(`${productId}|${fromId}|${toId}`)) return true;
+  }
+  for (const child of node.children ?? []) {
+    if (peggingTreeContainsRealMove(child, realMoveKeys)) return true;
+  }
+  return false;
+}
+
+/** Renders Plan KPIs when plan result exists; builds kpis from backend plan_kpis or derives from committed_demands/work_orders. */
+function PlanKpiDashboard({
+  planResult,
+}: {
+  planResult: {
+    committed_demands?: CommittedDemand[];
+    work_orders?: WorkOrder[];
+    plan_kpis?: PlanKpis;
+    supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
+  };
+}) {
+  let kpis: PlanKpis;
+  if (planResult.plan_kpis && typeof planResult.plan_kpis === 'object') {
+    kpis = planResult.plan_kpis;
+  } else {
+    const committed = planResult.committed_demands ?? [];
+    const wos = planResult.work_orders ?? [];
+    const totalCommitted = committed.reduce((s, c) => s + (Number(c.quantity) || 0), 0);
+    const byMethod = (method: string) => {
+      const list = wos.filter((wo) => (String(wo.method ?? '').trim().toLowerCase() === method));
+      const keyed = new Map<string, number>();
+      list.forEach((wo) => {
+        const key = `${wo.demand_id ?? ''}|${wo.product_id ?? ''}|${wo.location_id ?? ''}|${wo.method ?? ''}`;
+        keyed.set(key, (keyed.get(key) ?? 0) + (Number(wo.quantity) || 0));
+      });
+      return { order_count: keyed.size, total_quantity: Array.from(keyed.values()).reduce((a, b) => a + b, 0) };
+    };
+    const inv = planResult.supply_summary ?? { initial_total: 0, consumed_total: 0, consumption_rate: null };
+    kpis = {
+      delivery: {
+        total_requested: 0,
+        total_committed: totalCommitted,
+        fill_rate_pct: null,
+        demand_count: committed.length,
+        on_time_count: 0,
+      },
+      inventory: inv,
+      procurement: byMethod('purchase'),
+      manufacturing: byMethod('make'),
+      logistics: byMethod('move'),
+    };
+  }
+  const d = kpis.delivery ?? {};
+  const inv = kpis.inventory ?? {};
+  const proc = kpis.procurement ?? {};
+  const mfg = kpis.manufacturing ?? {};
+  const log = kpis.logistics ?? {};
+  const card = (title: string, items: { label: string; value: string }[], accent?: string) => (
+    <div key={title} style={{ flex: '1 1 160px', minWidth: 140, padding: '0.75rem 1rem', background: 'rgba(255,255,255,0.04)', borderRadius: 8, border: '1px solid #3d3d40' }}>
+      <div style={{ fontSize: '0.7rem', color: '#a1a1aa', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.5rem', fontWeight: 600 }}>{title}</div>
+      {items.map(({ label, value }) => (
+        <div key={label} style={{ marginTop: 4 }}>
+          <span style={{ fontSize: '0.75rem', color: '#71717a' }}>{label}</span>
+          <span style={{ display: 'block', fontSize: '1rem', fontWeight: 600, color: accent ?? '#e4e4e7' }}>{value}</span>
+        </div>
+      ))}
+    </div>
+  );
+  return (
+    <div style={{ marginTop: '1rem', marginBottom: '1rem', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: 8, border: '1px solid #52525b' }}>
+      <h4 style={{ margin: '0 0 0.75rem', fontSize: '1rem', color: '#e4e4e7', fontWeight: 600 }}>Plan KPIs</h4>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem' }}>
+        {card('Delivery performance', [
+          { label: 'Fill rate', value: d.fill_rate_pct != null ? `${Number(d.fill_rate_pct).toFixed(1)}%` : '–' },
+          { label: 'Committed / requested', value: `${Number(d.total_committed ?? 0).toLocaleString()} / ${Number(d.total_requested ?? 0).toLocaleString()}` },
+          { label: 'On time (demands)', value: `${d.on_time_count ?? 0} / ${d.demand_count ?? 0}` },
+          (() => {
+            const denom = d.fulfilled_with_tree_count ?? d.demand_count ?? 0;
+            if (!denom) return { label: 'Fulfilled by new builds', value: '–' };
+            const count = d.fulfilled_by_real_make_count ?? 0;
+            const pct = ((count / denom) * 100).toFixed(1);
+            return {
+              label: 'Fulfilled by new builds',
+              value: `${count} / ${denom} (${pct}%)`,
+            };
+          })(),
+          (() => {
+            const denom = d.fulfilled_with_tree_count ?? d.demand_count ?? 0;
+            if (!denom) return { label: 'Fulfilled by inventories', value: '–' };
+            const count = d.fulfilled_by_inventory_only_count ?? 0;
+            const pct = ((count / denom) * 100).toFixed(1);
+            return {
+              label: 'Fulfilled by inventories',
+              value: `${count} / ${denom} (${pct}%)`,
+            };
+          })(),
+        ], '#34d399')}
+        {card('Inventory consumption', [
+          { label: 'Consumption rate', value: inv.consumption_rate != null ? `${(Number(inv.consumption_rate) * 100).toFixed(1)}%` : '–' },
+          { label: 'Consumed', value: Number(inv.consumed_total ?? 0).toLocaleString() },
+          { label: 'Initial supply', value: Number(inv.initial_total ?? 0).toLocaleString() },
+        ], '#a78bfa')}
+        {card('Procurement (buy)', [
+          { label: 'Orders', value: String(proc.order_count ?? 0) },
+          { label: 'Total quantity', value: Number(proc.total_quantity ?? 0).toLocaleString() },
+        ], '#f59e0b')}
+        {card('Manufacturing (make)', [
+          { label: 'Orders', value: String(mfg.order_count ?? 0) },
+          { label: 'Total quantity', value: Number(mfg.total_quantity ?? 0).toLocaleString() },
+        ], '#3b82f6')}
+        {card('Logistics (move)', [
+          { label: 'Orders', value: String(log.order_count ?? 0) },
+          { label: 'Total quantity', value: Number(log.total_quantity ?? 0).toLocaleString() },
+        ], '#06b6d4')}
+      </div>
+    </div>
+  );
+}
+
 import { SortFilterTable } from '@/app/components/SortFilterTable';
 import { PeggingTree, pathKeyFromPath, type PeggingGraph } from '@/app/components/PeggingTree';
 
@@ -85,7 +246,13 @@ export default function CaseDetail() {
   const [caseSection, setCaseSection] = useState<'allocation' | 'planning'>('allocation');
   const [rawMaterialReport, setRawMaterialReport] = useState<RawMaterialUsageReport | null>(null);
   const [rawMaterialReportLoading, setRawMaterialReportLoading] = useState(false);
-  const [planResult, setPlanResult] = useState<{ committed_demands: CommittedDemand[]; work_orders: WorkOrder[]; planning_pegging: PlanningPeggingEntry[] } | null>(null);
+  const [planResult, setPlanResult] = useState<{
+    committed_demands: CommittedDemand[];
+    work_orders: WorkOrder[];
+    planning_pegging: PlanningPeggingEntry[];
+    supply_summary?: { initial_total: number; consumed_total: number; consumption_rate: number | null };
+    plan_kpis?: PlanKpis;
+  } | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
   const [planPeggingOpen, setPlanPeggingOpen] = useState(false);
@@ -93,9 +260,18 @@ export default function CaseDetail() {
   const [planPeggingExpanded, setPlanPeggingExpanded] = useState<Set<string>>(new Set(['0']));
   const [planExplanationExpanded, setPlanExplanationExpanded] = useState<Set<string>>(new Set());
   const [planPeggingPanelWidth, setPlanPeggingPanelWidth] = useState(420);
+  const [planWorkOrderPeggingCache, setPlanWorkOrderPeggingCache] = useState<Record<string, PlanningPeggingNode>>({});
+  const [planWorkOrderPeggingLoading, setPlanWorkOrderPeggingLoading] = useState<string | null>(null);
+  const [planWorkOrderPeggingError, setPlanWorkOrderPeggingError] = useState<string | null>(null);
   const planPeggingResizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [planPeggingResizing, setPlanPeggingResizing] = useState(false);
   const [planResultTab, setPlanResultTab] = useState<'demands' | 'work_orders'>('demands');
+  const [planWorkOrderHideDummyProdArea, setPlanWorkOrderHideDummyProdArea] = useState(true);
+  const [planDemandRealMakeOnly, setPlanDemandRealMakeOnly] = useState(false);
+  const [planDemandBuyOnly, setPlanDemandBuyOnly] = useState(false);
+  const [planDemandRealMoveOnly, setPlanDemandRealMoveOnly] = useState(false);
+  const [bomRealPairs, setBomRealPairs] = useState<[string, string][] | null>(null);
+  const [realMoveTriples, setRealMoveTriples] = useState<[string, string, string][] | null>(null);
   const [planningConfig, setPlanningConfig] = useState<PlanningConfig>({});
   const [planJobId, setPlanJobId] = useState<string | null>(null);
   const [planProgress, setPlanProgress] = useState<{ current: number; total: number } | null>(null);
@@ -160,6 +336,7 @@ export default function CaseDetail() {
         if (st.progress) setPlanProgress(st.progress);
         if (st.status === 'completed' && st.result) {
           setPlanResult(st.result);
+          setPlanWorkOrderPeggingCache({});
           setPlanJobId(null);
           setPlanLoading(false);
           setPlanProgress(null);
@@ -194,6 +371,70 @@ export default function CaseDetail() {
     };
   }, [planJobId, id]);
 
+  // Load real BOM pairs and real move triples once we have a plan result.
+  useEffect(() => {
+    if (!planResult || !planResult.committed_demands.length || !id) {
+      setBomRealPairs(null);
+      setRealMoveTriples(null);
+      return;
+    }
+    let cancelled = false;
+    Promise.all([getBomRealPairs(id), getMovesWithTransit(id)])
+      .then(([bomRes, moveRes]) => {
+        if (!cancelled) {
+          setBomRealPairs(bomRes.pairs ?? []);
+          setRealMoveTriples(moveRes.moves ?? []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBomRealPairs([]);
+          setRealMoveTriples([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, planResult]);
+
+  // Fetch work-order pegging on demand when slide-in opens for a WO.
+  const woPeggingKey =
+    planPeggingOpen && planPeggingContext?.type === 'work_order' && id
+      ? `${String(planPeggingContext.row.demand_id ?? '').trim()}|${String(planPeggingContext.row.product_id ?? '').trim()}|${String(planPeggingContext.row.location_id ?? '').trim()}|${String(planPeggingContext.row.method ?? '').trim()}`
+      : null;
+  useEffect(() => {
+    if (!woPeggingKey || !id || planPeggingContext?.type !== 'work_order') return;
+    const row = planPeggingContext.row as WorkOrder;
+    if (planWorkOrderPeggingCache[woPeggingKey]) return;
+    if (planWorkOrderPeggingLoading === woPeggingKey) return;
+    const demand_id = String(row.demand_id ?? '').trim();
+    const product_id = String(row.product_id ?? '').trim();
+    const location_id = String(row.location_id ?? '').trim();
+    const method = String(row.method ?? '').trim();
+    if (!demand_id || !product_id || !location_id || !method) {
+      const msg = `Missing work-order params (demand_id=${demand_id ? 'set' : 'empty'}, product_id=${product_id ? 'set' : 'empty'}, location_id=${location_id ? 'set' : 'empty'}, method=${method ? 'set' : 'empty'}). Re-run plan so work orders include demand_id.`;
+      if (typeof console !== 'undefined' && console.warn) console.warn('[WO pegging]', msg);
+      setPlanWorkOrderPeggingError(msg);
+      return;
+    }
+    setPlanWorkOrderPeggingError(null);
+    setPlanWorkOrderPeggingLoading(woPeggingKey);
+    if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Fetching', { caseId: id, demand_id, product_id, location_id, method });
+    getWorkOrderPegging(Number(id), { demand_id, product_id, location_id, method })
+      .then((res) => {
+        if (typeof console !== 'undefined' && console.log) console.log('[WO pegging] Loaded tree for', woPeggingKey);
+        setPlanWorkOrderPeggingCache((prev) => ({ ...prev, [woPeggingKey]: res.tree }));
+      })
+      .catch((err) => {
+        const message = err?.message ?? 'Failed to load work-order pegging';
+        if (typeof console !== 'undefined' && console.error) console.error('[WO pegging] Error', message, err);
+        setPlanWorkOrderPeggingError(message);
+      })
+      .finally(() => {
+        setPlanWorkOrderPeggingLoading(null);
+      });
+  }, [id, woPeggingKey, planPeggingContext?.type]);
+
   const basketInitialKeys = new Set(basketInitial.map((b) => b.key));
 
   function computeBasketAfterStep(stepIndex: number): { key: string; display: string; qty: number; fromInitialSupply: boolean }[] {
@@ -218,10 +459,11 @@ export default function CaseDetail() {
     }
     // Apply engine prunes: remove components unrelated to remaining allocation targets
     const keysToDelete: string[] = [];
-    for (const prune of basketPrunes) {
+    for (let i = 0; i < basketPrunes.length; i++) {
+      const prune = basketPrunes[i];
       if (prune.after_step > stepIndex) continue;
       for (const compKey of prune.comp_keys ?? []) {
-        for (const key of map.keys()) {
+        for (const key of Array.from(map.keys())) {
           const comp = key.includes('|') ? key.replace(/\|[^|]*$/, '') : key;
           if (comp === compKey) keysToDelete.push(key);
         }
@@ -1482,6 +1724,8 @@ export default function CaseDetail() {
         {planError && <p style={{ color: '#f87171', marginTop: '0.5rem' }}>{planError}</p>}
         {planResult && !planLoading && (
           <>
+            {/* Plan KPI dashboard – always show when plan result exists; build kpis safely from backend or client */}
+            <PlanKpiDashboard planResult={planResult} />
             <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1.5rem', marginBottom: '0.5rem' }}>
               <button
                 type="button"
@@ -1502,56 +1746,196 @@ export default function CaseDetail() {
               {planResultTab === 'demands' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Committed demands</h4>
-                  {planResult.committed_demands.length > 0 && (() => {
-                    const byCustomer = planResult.committed_demands.reduce<Record<string, number>>((acc, r) => {
-                      const c = (r.customer ?? r.customer_id ?? '–') as string;
-                      acc[c] = (acc[c] ?? 0) + (Number(r.quantity) || 0);
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandRealMakeOnly}
+                        onChange={(e) => setPlanDemandRealMakeOnly(e.target.checked)}
+                      />
+                      <span>Only demands with pegging including a real make (non-virtual BOM link)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandBuyOnly}
+                        onChange={(e) => setPlanDemandBuyOnly(e.target.checked)}
+                      />
+                      <span>Only demands with pegging including a buy work order (purchase)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandRealMoveOnly}
+                        onChange={(e) => setPlanDemandRealMoveOnly(e.target.checked)}
+                      />
+                      <span>Only demands with pegging including a real move (TRANSIT_TIME &gt; 0)</span>
+                    </label>
+                    {planDemandRealMakeOnly && (
+                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
+                        {bomRealPairs === null
+                          ? 'Loading real BOM pairs…'
+                          : bomRealPairs.length === 0
+                            ? 'No BOM rows with VIRTUAL <> Y in bom.csv; no \"real\" make links available.'
+                            : ''}
+                      </span>
+                    )}
+                    {planDemandRealMoveOnly && (
+                      <span style={{ fontSize: '0.8rem', color: '#a1a1aa' }}>
+                        {realMoveTriples === null
+                          ? 'Loading moves with TRANSIT_TIME > 0…'
+                          : realMoveTriples.length === 0
+                            ? 'No move methods with TRANSIT_TIME > 0 for this case.'
+                            : ''}
+                      </span>
+                    )}
+                  </div>
+                  {(() => {
+                    if (!planResult?.committed_demands.length) return null;
+                    const peggingByDemandId = (planResult.planning_pegging ?? []).reduce<Record<string, PlanningPeggingEntry>>((acc, e) => {
+                      if (e.demand_id) acc[e.demand_id] = e;
+                      return acc;
+                    }, {});
+                    let list = planResult.committed_demands;
+                    if (planDemandRealMakeOnly && bomRealPairs !== null) {
+                      const keys = new Set(bomRealPairs.map(([p, c]) => `${(p ?? '').trim()}|${(c ?? '').trim()}`));
+                      list = list.filter((r) => {
+                        const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
+                        const entry = demandId ? peggingByDemandId[demandId] : null;
+                        if (!entry?.tree) return false;
+                        return peggingTreeContainsRealMake(entry.tree, keys);
+                      });
+                    }
+                    if (planDemandBuyOnly) {
+                      list = list.filter((r) => {
+                        const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
+                        const entry = demandId ? peggingByDemandId[demandId] : null;
+                        if (!entry?.tree) return false;
+                        return peggingTreeContainsPurchase(entry.tree);
+                      });
+                    }
+                    if (planDemandRealMoveOnly && realMoveTriples !== null) {
+                      const moveKeys = new Set(realMoveTriples.map(([p, from_, to]) => `${(p ?? '').trim()}|${(from_ ?? '').trim()}|${(to ?? '').trim()}`));
+                      list = list.filter((r) => {
+                        const demandId = r.demand_id ?? (r as unknown as { demand_id?: string }).demand_id;
+                        const entry = demandId ? peggingByDemandId[demandId] : null;
+                        if (!entry?.tree) return false;
+                        return peggingTreeContainsRealMove(entry.tree, moveKeys);
+                      });
+                    }
+                    const byCustomer = list.reduce<Record<string, number>>((acc, r) => {
+                      const cName = (r.customer ?? r.customer_id ?? '–') as string;
+                      acc[cName] = (acc[cName] ?? 0) + (Number(r.quantity) || 0);
                       return acc;
                     }, {});
                     const hasMultipleCustomers = Object.keys(byCustomer).length > 1;
-                    return hasMultipleCustomers ? (
-                      <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
-                        <summary style={{ cursor: 'pointer' }}>Rollup by customer</summary>
-                        <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
-                          {Object.entries(byCustomer).map(([cust, qty]) => (
-                            <li key={cust}><strong>{cust}</strong>: {Number(qty).toLocaleString()} committed</li>
-                          ))}
-                        </ul>
-                      </details>
-                    ) : null;
+                    return (
+                      <>
+                        <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: hasMultipleCustomers ? '0.5rem' : '0.25rem' }}>
+                          Showing {list.length} of {planResult.committed_demands.length} demands
+                          {planDemandRealMakeOnly && !planDemandBuyOnly && !planDemandRealMoveOnly && ' with pegging including at least one real make (BOM VIRTUAL <> Y).'}
+                          {!planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' with pegging including at least one buy work order (purchase).'}
+                          {!planDemandRealMakeOnly && !planDemandBuyOnly && planDemandRealMoveOnly && ' with pegging including at least one real move (TRANSIT_TIME > 0).'}
+                          {planDemandRealMakeOnly && planDemandBuyOnly && !planDemandRealMoveOnly && ' with pegging including at least one real make and at least one buy work order.'}
+                          {(planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly) && [planDemandRealMakeOnly, planDemandBuyOnly, planDemandRealMoveOnly].filter(Boolean).length > 1 && ' (multiple filters active).'}
+                        </p>
+                        {planDemandRealMakeOnly && list.length === 0 && bomRealPairs !== null && bomRealPairs.length > 0 && (
+                          <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
+                            No demands in this plan have a make work order whose (parent, child) pair matches a BOM row with VIRTUAL &lt;&gt; Y.
+                          </p>
+                        )}
+                        {planDemandBuyOnly && list.length === 0 && (
+                          <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
+                            No demands in this plan have a work order with method &quot;purchase&quot; in their pegging tree.
+                          </p>
+                        )}
+                        {planDemandRealMoveOnly && list.length === 0 && realMoveTriples !== null && realMoveTriples.length > 0 && (
+                          <p style={{ fontSize: '0.8rem', color: '#71717a', marginBottom: '0.5rem' }}>
+                            No demands in this plan have a move work order with TRANSIT_TIME &gt; 0 in their pegging tree.
+                          </p>
+                        )}
+                        {hasMultipleCustomers && (
+                          <details style={{ fontSize: '0.875rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                            <summary style={{ cursor: 'pointer' }}>Rollup by customer (filtered set)</summary>
+                            <ul style={{ marginTop: '0.25rem', paddingLeft: '1.25rem' }}>
+                              {Object.entries(byCustomer).map(([cust, qty]) => (
+                                <li key={cust}><strong>{cust}</strong>: {Number(qty).toLocaleString()} committed</li>
+                              ))}
+                            </ul>
+                          </details>
+                        )}
+                        <SortFilterTable<CommittedDemand & { _key?: string; _customer?: string }>
+                          idKey="_key"
+                          rows={list.map((r, i) => ({
+                            ...r,
+                            _key: `cd-${r.demand_id ?? ''}-${r.product_id}-${r.location_id}-${i}`,
+                            _customer: String(r.customer ?? r.customer_id ?? ''),
+                          }))}
+                          filterKeys={['demand_id', '_customer', 'product_id', 'location_id', 'commit_time', 'commit_reason']}
+                          filterPlaceholder="Filter by demand ID, customer, product, location…"
+                          defaultSortKey="commit_time"
+                          stickyHeader
+                          columns={[
+                            { key: 'demand_id', label: 'Demand ID', sortable: true, render: (r) => r.demand_id ?? '–' },
+                            { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
+                            { key: 'product_id', label: 'Product', sortable: true },
+                            { key: 'location_id', label: 'Location', sortable: true },
+                            { key: 'quantity', label: 'Quantity', sortable: true },
+                            { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
+                            { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
+                            { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => r.commit_reason ?? '–' },
+                            { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => (
+                              <button type="button" className="secondary" onClick={() => { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); }}>Show</button>
+                            ) },
+                          ]}
+                        />
+                      </>
+                    );
                   })()}
-                  <SortFilterTable<CommittedDemand & { _key?: string; _customer?: string }>
-                    idKey="_key"
-                    rows={planResult.committed_demands.map((r, i) => ({
-                      ...r,
-                      _key: `cd-${r.demand_id ?? ''}-${r.product_id}-${r.location_id}-${i}`,
-                      _customer: String(r.customer ?? r.customer_id ?? ''),
-                    }))}
-                    filterKeys={['demand_id', '_customer', 'product_id', 'location_id', 'commit_time', 'commit_reason']}
-                    filterPlaceholder="Filter by demand ID, customer, product, location…"
-                    defaultSortKey="commit_time"
-                    stickyHeader
-                    columns={[
-                      { key: 'demand_id', label: 'Demand ID', sortable: true, render: (r) => r.demand_id ?? '–' },
-                      { key: '_customer', label: 'Customer', sortable: true, render: (r) => (r as { _customer?: string })._customer || (r.customer ?? r.customer_id ?? '–') },
-                      { key: 'product_id', label: 'Product', sortable: true },
-                      { key: 'location_id', label: 'Location', sortable: true },
-                      { key: 'quantity', label: 'Quantity', sortable: true },
-                      { key: 'request_time', label: 'Request time', sortable: true, render: (r) => r.request_time ?? '–' },
-                      { key: 'commit_time', label: 'Commit time', sortable: true, render: (r) => r.commit_time ?? '–' },
-                      { key: 'commit_reason', label: 'Commit reason', sortable: true, render: (r) => r.commit_reason ?? '–' },
-                      { key: '_pegging', label: 'Pegging', sortable: false, render: (r) => (
-                        <button type="button" className="secondary" onClick={() => { setPlanPeggingContext({ type: 'demand', row: r }); setPlanPeggingOpen(true); }}>Show</button>
-                      ) },
-                    ]}
-                  />
                 </div>
               )}
               {planResultTab === 'work_orders' && (
                 <div style={{ padding: '0.75rem 1rem' }}>
                   <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Work orders</h4>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planWorkOrderHideDummyProdArea}
+                        onChange={(e) => setPlanWorkOrderHideDummyProdArea(e.target.checked)}
+                      />
+                      <span>Hide PROD_AREA = dummy</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandRealMakeOnly}
+                        onChange={(e) => setPlanDemandRealMakeOnly(e.target.checked)}
+                      />
+                      <span>Only work orders whose pegging includes a real make (non-virtual BOM link)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandBuyOnly}
+                        onChange={(e) => setPlanDemandBuyOnly(e.target.checked)}
+                      />
+                      <span>Only work orders whose pegging includes a buy (purchase)</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', color: '#e4e4e7' }}>
+                      <input
+                        type="checkbox"
+                        checked={planDemandRealMoveOnly}
+                        onChange={(e) => setPlanDemandRealMoveOnly(e.target.checked)}
+                      />
+                      <span>Only work orders whose pegging includes a real move (TRANSIT_TIME &gt; 0)</span>
+                    </label>
+                  </div>
                   {planResult.work_orders.length > 0 && (() => {
-                    const byProdArea = planResult.work_orders.reduce<Record<string, number>>((acc, r) => {
+                    const workOrdersFiltered = planWorkOrderHideDummyProdArea
+                      ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
+                      : planResult.work_orders;
+                    const byProdArea = workOrdersFiltered.reduce<Record<string, number>>((acc, r) => {
                       const pa = (r.prod_area ?? '–') as string;
                       acc[pa] = (acc[pa] ?? 0) + (Number(r.quantity) || 0);
                       return acc;
@@ -1568,9 +1952,60 @@ export default function CaseDetail() {
                       </details>
                     ) : null;
                   })()}
-                  <SortFilterTable<WorkOrder & { _key?: string; _prod_area?: string }>
+                  {(() => {
+                    let workOrderRows = planWorkOrderHideDummyProdArea
+                      ? planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() !== 'dummy')
+                      : planResult.work_orders;
+                    // Filters refer to work-order pegging (each WO's supplies subtree), not demand pegging.
+                    const anyPeggingFilter = planDemandRealMakeOnly || planDemandBuyOnly || planDemandRealMoveOnly;
+                    if (anyPeggingFilter) {
+                      workOrderRows = workOrderRows.filter((r) => {
+                        if (planDemandRealMakeOnly && !(r.pegging_includes_real_make === true)) return false;
+                        if (planDemandBuyOnly && !(r.pegging_includes_buy === true)) return false;
+                        if (planDemandRealMoveOnly && !(r.pegging_includes_real_move === true)) return false;
+                        return true;
+                      });
+                    }
+                    // Aggregate lots with the same logical WO key so the table shows total quantity per work order
+                    const grouped = new Map<string, WorkOrder>();
+                    for (const r of workOrderRows) {
+                      const key = [
+                        String(r.demand_id ?? ''),
+                        String(r.product_id ?? ''),
+                        String(r.location_id ?? ''),
+                        String(r.method ?? ''),
+                        String(r.location_source ?? ''),
+                        String(r.prod_area ?? ''),
+                      ].join('|');
+                      const existing = grouped.get(key);
+                      const rowQty = Number(r.quantity ?? 0) || 0;
+                      if (!existing) {
+                        grouped.set(key, { ...r, quantity: rowQty });
+                      } else {
+                        existing.quantity = (Number(existing.quantity ?? 0) || 0) + rowQty;
+                        // For time range, keep earliest start and latest end across lots
+                        if (r.start_time && (!existing.start_time || r.start_time < existing.start_time)) {
+                          existing.start_time = r.start_time;
+                        }
+                        if (r.end_time && (!existing.end_time || r.end_time > existing.end_time)) {
+                          existing.end_time = r.end_time;
+                        }
+                      }
+                    }
+                    const groupedRows = Array.from(grouped.values());
+                    const dummyHiddenCount = planResult.work_orders.filter((r) => (r.prod_area ?? '').trim().toLowerCase() === 'dummy').length;
+                    return (
+                      <>
+                        <p style={{ fontSize: '0.8rem', color: '#a1a1aa', marginBottom: '0.5rem' }}>
+                          Showing {groupedRows.length.toLocaleString()} work order{groupedRows.length !== 1 ? 's' : ''}
+                          {planWorkOrderHideDummyProdArea && dummyHiddenCount > 0
+                            ? ` (${dummyHiddenCount.toLocaleString()} with PROD_AREA = dummy hidden)`
+                            : ''}
+                          {anyPeggingFilter ? ' (filtered by work-order pegging: real make / buy / real move).' : ''}
+                        </p>
+                        <SortFilterTable<WorkOrder & { _key?: string; _prod_area?: string }>
                     idKey="_key"
-                    rows={planResult.work_orders.map((r, i) => ({
+                    rows={groupedRows.map((r, i) => ({
                       ...r,
                       _key: `wo-${i}-${r.product_id}-${r.location_id}`,
                       _prod_area: String(r.prod_area ?? ''),
@@ -1582,7 +2017,7 @@ export default function CaseDetail() {
                     columns={[
                       { key: 'product_id', label: 'Product', sortable: true },
                       { key: 'location_id', label: 'Location', sortable: true },
-                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => (r as { _prod_area?: string })._prod_area || r.prod_area ?? '–' },
+                      { key: '_prod_area', label: 'PROD_AREA', sortable: true, render: (r) => ((r as { _prod_area?: string })._prod_area || r.prod_area) ?? '–' },
                       { key: 'quantity', label: 'Quantity', sortable: true },
                       { key: 'start_time', label: 'Start time', sortable: true, render: (r) => r.start_time ?? '–' },
                       { key: 'end_time', label: 'End time', sortable: true, render: (r) => r.end_time ?? '–' },
@@ -1593,6 +2028,9 @@ export default function CaseDetail() {
                       ) },
                     ]}
                   />
+                      </>
+                    );
+                  })()}
                 </div>
               )}
             </div>
@@ -1727,7 +2165,7 @@ export default function CaseDetail() {
         </div>,
         document.body
       )}
-      {planPeggingOpen && planPeggingContext && planResult && typeof document !== 'undefined' && createPortal(
+      {planPeggingOpen && planPeggingContext && typeof document !== 'undefined' && (planPeggingContext.type === 'demand' ? !!planResult : true) && createPortal(
         <div
           style={{
             position: 'fixed',
@@ -1742,7 +2180,7 @@ export default function CaseDetail() {
         >
           <div
             style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 0, pointerEvents: 'auto' }}
-            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); }}
+            onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); }}
             aria-hidden
           />
           <div
@@ -1790,19 +2228,45 @@ export default function CaseDetail() {
                   ? `Pegging: ${planPeggingContext.row.demand_id ?? planPeggingContext.row.product_id}`
                   : `Pegging: ${planPeggingContext.row.product_id} @ ${planPeggingContext.row.location_id}`}
               </h3>
-              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
+              <button type="button" onClick={() => { setPlanPeggingOpen(false); setPlanPeggingContext(null); setPlanWorkOrderPeggingError(null); }} style={{ padding: '6px 12px', background: '#2d2d30', color: '#e4e4e7', border: '1px solid #3d3d40', borderRadius: 6, cursor: 'pointer' }}>Close</button>
             </div>
             <p style={{ margin: 0, marginBottom: '0.5rem', fontSize: '0.8rem', color: '#71717a' }}>
-              ▢ Inventory (static state) and ⚙ Work order (transformation). Root = target inventory; work orders transform between states; leaves = supply or purchase inventory.
+              {planPeggingContext.type === 'work_order'
+                ? 'Root = this work order; below it are the supplies that fulfill it (inventory, child work orders, purchase) at all levels.'
+                : '▢ Inventory (static state) and ⚙ Work order (transformation). Root = target inventory; work orders transform between states; leaves = supply or purchase inventory.'}
+              {' '}
+              When multiple inventories or work orders appear as siblings under the same parent, they are alternative paths <strong>OR</strong> that can each supply flow to that parent.
             </p>
             {(() => {
-              const demandId = planPeggingContext.type === 'demand'
-                ? planPeggingContext.row.demand_id
-                : (planPeggingContext.row as WorkOrder).demand_id;
-              const entry = planResult.planning_pegging?.find((e) => e.demand_id === demandId);
-              const tree = entry?.tree;
-              if (!tree) {
-                return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
+              let tree: PlanningPeggingNode | null = null;
+              if (planPeggingContext.type === 'work_order') {
+                if (planWorkOrderPeggingLoading === woPeggingKey || (woPeggingKey && !planWorkOrderPeggingCache[woPeggingKey] && !planWorkOrderPeggingError)) {
+                  return (
+                    <div style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>
+                      <p>Loading pegging…</p>
+                      <p style={{ fontSize: '0.75rem', marginTop: '0.5rem', color: '#71717a' }}>
+                        If this hangs: run plan first (backend stores result per case), then open pegging. Check browser console (F12) and backend logs for errors.
+                      </p>
+                    </div>
+                  );
+                }
+                if (planWorkOrderPeggingError) {
+                  return <p style={{ color: '#f87171', fontSize: '0.9rem' }}>{planWorkOrderPeggingError}</p>;
+                }
+                tree = woPeggingKey ? planWorkOrderPeggingCache[woPeggingKey] ?? null : null;
+                if (!tree) {
+                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging for this work order. Run plan first.</p>;
+                }
+              } else {
+                if (!planResult) {
+                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No plan result.</p>;
+                }
+                const demandIdNorm = String(planPeggingContext.row.demand_id ?? '').trim();
+                const entry = planResult.planning_pegging?.find((e) => String(e.demand_id ?? '').trim() === demandIdNorm);
+                tree = entry?.tree ?? null;
+                if (!tree) {
+                  return <p style={{ color: '#a1a1aa', fontSize: '0.9rem' }}>No pegging tree for this demand. Re-run plan to get planning_pegging.</p>;
+                }
               }
               function renderNode(node: PlanningPeggingNode, path: string, depth: number) {
                 const childrenList = node.children ?? [];
@@ -1819,14 +2283,41 @@ export default function CaseDetail() {
                 const isInventory = node.type === 'demand' || node.type === 'supply' || node.type === 'purchase';
                 const icon = isInventory ? '▢' : '⚙';
                 const typeLabel = isInventory ? 'Inventory' : 'Work order';
+                // When viewing work-order pegging, root node quantity must match the table row the user clicked
+                const woRowQty = planPeggingContext?.type === 'work_order' && isRoot && path === '0'
+                  ? Number((planPeggingContext.row as WorkOrder).quantity ?? 0)
+                  : null;
                 const label = node.type === 'demand'
-                  ? `${node.demand_id ?? node.product_id} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}`
+                  ? `${node.product_id ?? node.demand_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} @ ${node.location_id ?? '–'}${node.demand_id && node.product_id !== node.demand_id ? ` (demand ${node.demand_id})` : ''}`
                   : node.type === 'work_order'
-                    ? `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()}${node.end_time ? ` · end ${node.end_time}` : ''}`
+                    ? (() => {
+                        const qty = woRowQty ?? Number(node.quantity ?? 0);
+                        const lotCount = (node as { lot_count?: number | null }).lot_count ?? null;
+                        const maxLotSize = (node as { max_lot_size?: number | null }).max_lot_size ?? null;
+                        const lotPart =
+                          lotCount && lotCount > 1 && maxLotSize
+                            ? ` · ${lotCount} lots of up to ${Number(maxLotSize).toLocaleString()}`
+                            : '';
+                        return `${node.method} ${node.product_id} @ ${node.location_id ?? '–'} · ${qty.toLocaleString()}${node.end_time ? ` · end ${node.end_time}` : ''}${lotPart}`;
+                      })()
                     : node.type === 'supply'
                       ? `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} (supply)`
                       : `${node.product_id} @ ${node.location_id ?? '–'} · ${Number(node.quantity ?? 0).toLocaleString()} (purchase)`;
                 const indentPx = 12;
+                let childGroupLabel: string | null = null;
+                let childGroupKind: 'and' | 'or' | null = null;
+                const relation = node.children_relation as 'and' | 'or' | undefined;
+                if (relation === 'or' && hasChildren && childrenList.length > 1) {
+                  childGroupKind = 'or';
+                  childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
+                } else if (relation === 'and' && hasChildren && childrenList.length > 1) {
+                  childGroupKind = 'and';
+                  childGroupLabel = 'ALL of the inventories / work orders below are required together (AND).';
+                } else if (!relation && hasChildren && childrenList.length > 1 && node.type !== 'work_order') {
+                  // Fallback: multiple inbound options into an inventory/demand node behave as OR.
+                  childGroupKind = 'or';
+                  childGroupLabel = 'ANY of the inventories / work orders below can supply this node (OR).';
+                }
                 return (
                   <div key={path} style={{ marginBottom: 4 }}>
                     <button
@@ -1899,9 +2390,33 @@ export default function CaseDetail() {
                     })()}
                     {expandable && isExpanded && (
                       <div style={{ marginTop: 2, paddingLeft: indentPx }}>
+                        {childGroupLabel && (
+                          <div
+                            style={{
+                              marginBottom: 2,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 4,
+                              fontSize: '0.7rem',
+                              color: childGroupKind === 'and' ? '#f97316' : '#38bdf8',
+                              backgroundColor: childGroupKind === 'and' ? 'rgba(249,115,22,0.12)' : 'rgba(56,189,248,0.12)',
+                              borderRadius: 999,
+                              padding: '1px 6px',
+                            }}
+                          >
+                            <span style={{ fontWeight: 700 }}>{childGroupKind === 'and' ? 'AND' : 'OR'}</span>
+                            <span>{childGroupLabel}</span>
+                          </div>
+                        )}
                         {hasChildren
                           ? childrenList.map((child, i) => renderNode(child, `${path}-${i}`, depth + 1))
-                          : <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>No work orders — planning failed or no method for this demand.</p>}
+                          : (
+                              <p style={{ margin: 0, fontSize: '0.8rem', color: '#71717a' }}>
+                                {node.type === 'work_order'
+                                  ? 'No supply breakdown in pegging for this work order (no component nodes or depth-limited).'
+                                  : 'No work orders — planning failed or no method for this demand.'}
+                              </p>
+                            )}
                       </div>
                     )}
                   </div>
@@ -2187,35 +2702,6 @@ export default function CaseDetail() {
         </div>,
         document.body
       )}
-      <section style={{ marginTop: '2rem' }}>
-        <h2>Manual overrides</h2>
-        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginBottom: '1rem' }}>
-          <select value={overrideForm.entity_type} onChange={(e) => setOverrideForm({ ...overrideForm, entity_type: e.target.value })}>
-            <option value="supply">supply</option>
-            <option value="demand">demand</option>
-            <option value="allocation">allocation</option>
-          </select>
-          <input placeholder="Entity key" value={overrideForm.entity_key} onChange={(e) => setOverrideForm({ ...overrideForm, entity_key: e.target.value })} />
-          <input placeholder='{"quantity": 100}' value={overrideForm.payload} onChange={(e) => setOverrideForm({ ...overrideForm, payload: e.target.value })} style={{ minWidth: 160 }} />
-          <button onClick={handleAddOverride}>Add override</button>
-        </div>
-        <table>
-          <thead>
-            <tr><th>Type</th><th>Key</th><th>Payload</th><th></th></tr>
-          </thead>
-          <tbody>
-            {overrides.map((o) => (
-              <tr key={o.id}>
-                <td>{o.entity_type}</td>
-                <td>{o.entity_key}</td>
-                <td><code>{JSON.stringify(o.payload)}</code></td>
-                <td><button className="danger" onClick={() => handleDeleteOverride(o.id)}>Remove</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {overrides.length === 0 && <p>No overrides. Add one to fix supply/demand quantities or assignments.</p>}
-      </section>
     </div>
   );
 }

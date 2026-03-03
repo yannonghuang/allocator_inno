@@ -46,7 +46,7 @@ def load_case_data(db: Session, case_id: int) -> dict[str, Any]:
         "customer": [{"customer": r.customer, "description": r.description} for r in customers],
         "demand": [
             {
-                "demand_id": r.demand_id,
+                "demand_id": r.demand_id or f"demand_{r.id}",
                 "description": r.description,
                 "customer_id": r.customer_id,
                 "customer": cust_by_id.get(r.customer_id, r.customer_id),

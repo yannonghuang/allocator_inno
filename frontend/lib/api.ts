@@ -47,6 +47,8 @@ export type AllocationViewRow = {
   target_product_id?: string;
   target_location_id?: string;
   basket_step_index?: number;
+  /** Step index after this row (sometimes provided by backend). */
+  after_step?: number | null;
 };
 export type ManualOverride = { id: number; case_id: number; entity_type: string; entity_key: string; payload: Record<string, unknown> };
 
@@ -165,7 +167,23 @@ export async function getFeasibleDemands(caseId: number, runId: number): Promise
 
 /** Demand-to-supply planning: returns committed demands (with commit_time), work orders, and planning pegging trees. */
 export type CommittedDemand = { demand_id?: string | null; customer_id?: string | null; customer?: string | null; product_id: string; location_id: string; quantity: number; request_time?: string | null; commit_time: string | null; commit_reason?: string | null };
-export type WorkOrder = { product_id: string; location_id: string; quantity: number; start_time: string | null; end_time: string | null; method: string; location_source?: string | null; demand_id?: string | null; prod_area?: string | null };
+export type WorkOrder = {
+  product_id: string;
+  location_id: string;
+  quantity: number;
+  start_time: string | null;
+  end_time: string | null;
+  method: string;
+  location_source?: string | null;
+  demand_id?: string | null;
+  prod_area?: string | null;
+  /** True if this WO's pegging (supplies that fulfill it) includes a real make (non-virtual BOM). */
+  pegging_includes_real_make?: boolean;
+  /** True if this WO's pegging includes a buy (purchase). */
+  pegging_includes_buy?: boolean;
+  /** True if this WO's pegging includes a real move (TRANSIT_TIME > 0). */
+  pegging_includes_real_move?: boolean;
+};
 
 /** Planning pegging tree node: demand (root) -> work_order -> ... -> supply | purchase (leaves). */
 export type PlanningPeggingNode = {
@@ -185,10 +203,37 @@ export type PlanningPeggingNode = {
   method_choice_explanation?: string | null;
   /** Why this BOM/variant was chosen when multiple ALT_GROUP variants exist (make only). */
   variant_choice_explanation?: string | null;
+  /** How this node's children relate logically, when known. 'or' is used when single-component variants are alternatives. */
+  children_relation?: 'and' | 'or';
+  /** For make work orders: how many production lots were created and the max lot size used. */
+  lot_count?: number | null;
+  max_lot_size?: number | null;
   children: PlanningPeggingNode[];
 };
 
 export type PlanningPeggingEntry = { demand_id: string; tree: PlanningPeggingNode };
+
+/** Plan KPI dashboard: delivery, inventory, procurement, manufacturing, logistics. */
+export type PlanKpis = {
+  delivery: {
+    total_requested: number;
+    total_committed: number;
+    fill_rate_pct: number | null;
+    demand_count: number;
+    on_time_count: number;
+    fulfilled_with_tree_count?: number;
+    fulfilled_by_real_make_count?: number;
+    fulfilled_by_inventory_only_count?: number;
+  };
+  inventory: {
+    initial_total: number;
+    consumed_total: number;
+    consumption_rate: number | null;
+  };
+  procurement: { order_count: number; total_quantity: number };
+  manufacturing: { order_count: number; total_quantity: number };
+  logistics: { order_count: number; total_quantity: number };
+};
 
 /** Config for planning (e.g. get_preferred_variants). Sent in POST body to /plan. */
 export type PlanningConfig = {
@@ -213,6 +258,36 @@ export async function runPlan(
     headers: { 'Content-Type': 'application/json' },
     body,
   });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** BOM (PARENT_ID, CHILD_ID) pairs that are "real" (VIRTUAL <> 'Y' in bom.csv). */
+export async function getBomRealPairs(caseId: number): Promise<{ pairs: [string, string][] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/products-with-real-bom`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Move methods with TRANSIT_TIME > 0 (real moves). Each tuple: [product_id, from_location_id, to_location_id]. */
+export async function getMovesWithTransit(caseId: number): Promise<{ moves: [string, string, string][] }> {
+  const r = await fetch(`${API}/cases/${caseId}/plan/moves-with-transit`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+/** Fetch work-order pegging on demand: how this WO is fulfilled by its supplies (all levels). Requires a prior plan run. */
+export async function getWorkOrderPegging(
+  caseId: number,
+  params: { demand_id: string; product_id: string; location_id: string; method: string }
+): Promise<{ tree: PlanningPeggingNode }> {
+  const sp = new URLSearchParams({
+    demand_id: params.demand_id,
+    product_id: params.product_id,
+    location_id: params.location_id,
+    method: params.method,
+  });
+  const r = await fetch(`${API}/cases/${caseId}/plan/work-order-pegging?${sp.toString()}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

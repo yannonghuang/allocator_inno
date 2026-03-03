@@ -5,11 +5,49 @@ and planned work orders. See spec.md (planning algorithm).
 from __future__ import annotations
 
 import logging
+import csv
+from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+
+def _load_real_bom_pairs_from_csv() -> frozenset[tuple[str, str]]:
+    """
+    Load (parent_id, child_id) pairs from csv/bom.csv where VIRTUAL column exists and VIRTUAL <> 'Y'.
+    This is used only for logging which BOM links are considered 'real' during pegging construction.
+    """
+    try:
+        root = Path(__file__).resolve().parents[3]
+    except IndexError:
+        root = Path(__file__).resolve().parent.parent.parent
+    bom_csv = root / "csv" / "bom.csv"
+    if not bom_csv.exists():
+        return frozenset()
+    pairs: set[tuple[str, str]] = set()
+    try:
+        with bom_csv.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            has_virtual = "VIRTUAL" in (reader.fieldnames or [])
+            for row in reader:
+                parent = (row.get("PARENT_ID") or "").strip()
+                child = (row.get("CHILD_ID") or "").strip()
+                if not parent or not child:
+                    continue
+                if has_virtual:
+                    v = (row.get("VIRTUAL") or "").strip().upper()
+                    # Real BOM row: VIRTUAL not equal to 'Y'
+                    if v == "Y":
+                        continue
+                pairs.add((parent, child))
+    except Exception:
+        return frozenset()
+    return frozenset(pairs)
+
+
+REAL_BOM_PAIRS: frozenset[tuple[str, str]] = _load_real_bom_pairs_from_csv()
 
 # Date format used in demand.request_due_time and supply.supply_date
 DATE_FMT = "%Y-%m-%d"
@@ -20,6 +58,9 @@ MAX_PLAN_DEPTH = 500
 # Pegging tree node: demand (root) -> work_order -> ... -> work_order | supply | purchase (leaves)
 # type 'demand' | 'work_order' | 'supply' | 'purchase'
 # All nodes have type, children (list, empty for leaves). Attrs vary by type.
+# Optional field children_relation:
+# - 'and': children are jointly required (e.g. BOM components under a variant)
+# - 'or': children are alternatives (e.g. single-component variants chosen for the same make)
 PeggingNode = dict[str, Any]
 
 
@@ -289,13 +330,19 @@ def _variants_for_make(
     """
     Group BOM rows by ALT_GROUP (same BOM_ID, PARENT_ID). Each group = one variant (requirement set).
     Returns list of (alt_group_key, child_materials) where child_materials = [{ product_id, location_id, quantity }, ...].
+    If no rows match the method's bom_id, fall back to any BOM rows with parent_id = product_id (so method_make
+    rows whose bom_id is not in bom.csv still get a component tree from the parent's BOM).
     """
-    bom_id = method.get("bom_id")
+    bom_id = (method.get("bom_id") or "").strip()
     if not bom_id:
         return []
+    product_id = (product_id or "").strip()
     by_alt: dict[str, list[dict]] = {}
-    for b in data.get("bom") or []:
-        if (b.get("bom_id") or "") != bom_id or (b.get("parent_id") or "") != product_id:
+    bom_list = data.get("bom") or []
+    for b in bom_list:
+        if (b.get("parent_id") or "").strip() != product_id:
+            continue
+        if (b.get("bom_id") or "").strip() != bom_id:
             continue
         rate = float(b.get("rate") or 1.0)
         if rate <= 0:
@@ -311,7 +358,34 @@ def _variants_for_make(
         if alt_key not in by_alt:
             by_alt[alt_key] = []
         by_alt[alt_key].append(entry)
-    return [(k, v) for k, v in by_alt.items()]
+    if by_alt:
+        return [(k, v) for k, v in by_alt.items()]
+    if bom_id:
+        by_alt_fallback: dict[str, list[dict]] = {}
+        for b in bom_list:
+            if (b.get("parent_id") or "").strip() != product_id:
+                continue
+            rate = float(b.get("rate") or 1.0)
+            if rate <= 0:
+                continue
+            ag = b.get("alt_group")
+            alt_key = str(ag).strip() if ag is not None and str(ag).strip() else "__null__"
+            child_qty = quantity * rate
+            entry = {
+                "product_id": b.get("child_id") or "",
+                "location_id": location_id or "",
+                "quantity": child_qty,
+            }
+            if alt_key not in by_alt_fallback:
+                by_alt_fallback[alt_key] = []
+            by_alt_fallback[alt_key].append(entry)
+        if by_alt_fallback:
+            logger.debug(
+                "variants_for_make: no BOM rows for bom_id=%s parent=%s; using fallback by parent_id (found %s variant(s))",
+                bom_id, product_id, len(by_alt_fallback),
+            )
+            return [(k, v) for k, v in by_alt_fallback.items()]
+    return []
 
 
 def _copy_inventory(inventory: list[dict]) -> list[dict]:
@@ -747,6 +821,7 @@ def plan(
             elif m.get("type") == "purchase":
                 lead_days = float(m.get("lead_days_supply") or 0)
 
+            wo_children_relation: str | None = None
             if m.get("type") == "make":
                 variants = _variants_for_make(product_id, production_location, method_qty, m, data)
                 variant_list, variant_explanation = get_preferred_variants(
@@ -756,6 +831,13 @@ def plan(
                     top_n=top_n,
                 )
                 child_materials = [c for (cm, _ak, _qty) in variant_list for c in cm]
+                # Determine whether child inventories under this work order represent OR (single-component variants) or AND (BOM components).
+                if len(variant_list) > 1:
+                    all_single_component = all(len(cm) == 1 for (cm, _ak, _qty) in variant_list)
+                    if all_single_component:
+                        wo_children_relation = "or"
+                    else:
+                        wo_children_relation = "and"
             elif m.get("type") == "move":
                 child_materials = _child_materials_for_move(m, method_qty)
                 variant_explanation = ""
@@ -767,9 +849,20 @@ def plan(
             commit_times: list[datetime] = []
             child_pegging_nodes: list[PeggingNode] = []
             for c in child_materials:
+                if m.get("type") == "make":
+                    parent_key = (product_id or "").strip()
+                    child_key = (c.get("product_id") or "").strip()
+                    if (parent_key, child_key) in REAL_BOM_PAIRS:
+                        logger.info(
+                            "planning: real BOM used (VIRTUAL<>Y) parent_id=%s child_id=%s demand_id=%s qty=%s (equal-split methods)",
+                            parent_key,
+                            child_key,
+                            demand_id,
+                            c.get("quantity"),
+                        )
                 c_req_dt = _date_add_days(req_dt, -lead_days) if req_dt else None
                 c_demand = {
-                    "demand_id": None,
+                    "demand_id": demand_id,
                     "product_id": c["product_id"],
                     "location_id": c["location_id"],
                     "quantity": c["quantity"],
@@ -823,6 +916,7 @@ def plan(
             left = method_qty
             lot_start = start_dt
             last_end = end_dt
+            lot_count = 0
             while left > 1e-9 and lot_start is not None:
                 lot_qty = min(lot_size, left)
                 lot_end = _date_add_days(lot_start, lead_days) if lot_start else None
@@ -839,6 +933,7 @@ def plan(
                 })
                 last_end = lot_end
                 left -= lot_qty
+                lot_count += 1
                 if left > 1e-9:
                     lot_start = lot_end
 
@@ -866,6 +961,9 @@ def plan(
                 "location_source": m.get("from_location_id") if method_type == "move" else None,
                 "method_choice_explanation": method_choice_explanation,
                 "variant_choice_explanation": variant_explanation if variant_explanation else None,
+                "children_relation": wo_children_relation,
+                "lot_count": lot_count if lot_count > 0 else None,
+                "max_lot_size": float(lot_size_val) if lot_size_val is not None else None,
                 "children": wo_children,
             }
             all_pegging_wo_nodes.append(wo_node)
@@ -929,6 +1027,7 @@ def plan(
         lead_days = float(m.get("lead_days_supply") or 0)
 
     # 3) Child materials (at production location for make); use get_preferred_variants (multiple, top_n, score_weights from config)
+    wo_children_relation: str | None = None
     if m.get("type") == "make":
         variants = _variants_for_make(product_id, production_location, demand_net_qty, m, data)
         variant_list, variant_explanation = get_preferred_variants(
@@ -938,6 +1037,12 @@ def plan(
             top_n=top_n,
         )
         child_materials = [c for (cm, _ak, _qty) in variant_list for c in cm]
+        if len(variant_list) > 1:
+            all_single_component = all(len(cm) == 1 for (cm, _ak, _qty) in variant_list)
+            if all_single_component:
+                wo_children_relation = "or"
+            else:
+                wo_children_relation = "and"
     elif m.get("type") == "move":
         child_materials = _child_materials_for_move(m, demand_net_qty)
         variant_explanation = ""
@@ -951,9 +1056,20 @@ def plan(
     commit_times: list[datetime] = []
     child_pegging_nodes: list[PeggingNode] = []
     for c in child_materials:
+        if m.get("type") == "make":
+            parent_key = (product_id or "").strip()
+            child_key = (c.get("product_id") or "").strip()
+            if (parent_key, child_key) in REAL_BOM_PAIRS:
+                logger.info(
+                    "planning: real BOM used (VIRTUAL<>Y) parent_id=%s child_id=%s demand_id=%s qty=%s",
+                    parent_key,
+                    child_key,
+                    demand_id,
+                    c.get("quantity"),
+                )
         c_req_dt = _date_add_days(req_dt, -lead_days) if req_dt else None
         c_demand = {
-            "demand_id": None,
+            "demand_id": demand_id,
             "product_id": c["product_id"],
             "location_id": c["location_id"],
             "quantity": c["quantity"],
@@ -1014,6 +1130,7 @@ def plan(
     lot_start = start_dt
     last_end = end_dt
     idx = 0
+    lot_count = 0
     while left > 1e-9 and lot_start is not None:
         lot_qty = min(lot_size, left)
         lot_end = _date_add_days(lot_start, lead_days) if lot_start else None
@@ -1031,6 +1148,7 @@ def plan(
         last_end = lot_end
         left -= lot_qty
         idx += 1
+        lot_count += 1
         if left > 1e-9:
             lot_start = lot_end
 
@@ -1057,6 +1175,9 @@ def plan(
         "location_source": m.get("from_location_id") if method_type == "move" else None,
         "method_choice_explanation": method_choice_explanation,
         "variant_choice_explanation": variant_explanation if variant_explanation else None,
+        "children_relation": wo_children_relation,
+        "lot_count": lot_count if lot_count > 0 else None,
+        "max_lot_size": float(lot_size_val) if lot_size_val is not None else None,
         "children": wo_children,
     }
     pegging_children.append(wo_node)
