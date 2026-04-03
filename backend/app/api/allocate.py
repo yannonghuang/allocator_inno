@@ -511,7 +511,19 @@ def _plan_kpis(data: dict, result: dict) -> dict:
 
     # Method breakdown (aggregate by method; same key = one logical WO)
     def _method_stats(method_val: str) -> dict:
-        wos = [wo for wo in work_orders if (str(wo.get("method") or "").strip().lower() == method_val)]
+        # Only count real make / real move in KPIs; for other methods, include all.
+        wos = [
+            wo
+            for wo in work_orders
+            if str(wo.get("method") or "").strip().lower() == method_val
+            and (
+                method_val not in ("make", "move")
+                or (
+                    (method_val == "make" and bool(wo.get("pegging_includes_real_make")))
+                    or (method_val == "move" and bool(wo.get("pegging_includes_real_move")))
+                )
+            )
+        ]
         # Dedupe by (demand_id, product_id, location_id, method) and sum quantity
         seen: dict[tuple, float] = {}
         for wo in wos:
@@ -687,11 +699,11 @@ def _run_planning_background(job_id: str, case_id: int, config: Any) -> None:
                     _plan_jobs[job_id]["progress"] = dict(progress)
 
         result = run_planning(data, config=config, progress_callback=progress_cb)
-        result["plan_kpis"] = _plan_kpis(data, result)
-        result["supply_summary"] = result["plan_kpis"]["inventory"]
         bom_pairs = _get_bom_real_pairs_for_enrichment()
         move_triples = _get_move_triples_with_transit(db, case_id)
         _enrich_work_orders_with_pegging_flags(result, bom_pairs, move_triples)
+        result["plan_kpis"] = _plan_kpis(data, result)
+        result["supply_summary"] = result["plan_kpis"]["inventory"]
         with _plan_jobs_lock:
             if job_id in _plan_jobs:
                 _plan_jobs[job_id]["status"] = "completed"
@@ -772,11 +784,11 @@ def run_plan(
         )
 
     result = run_planning(data, config=config)
-    result["plan_kpis"] = _plan_kpis(data, result)
-    result["supply_summary"] = result["plan_kpis"]["inventory"]
     bom_pairs = _get_bom_real_pairs_for_enrichment()
     move_triples = _get_move_triples_with_transit(db, case_id)
     _enrich_work_orders_with_pegging_flags(result, bom_pairs, move_triples)
+    result["plan_kpis"] = _plan_kpis(data, result)
+    result["supply_summary"] = result["plan_kpis"]["inventory"]
     with _case_plan_results_lock:
         _case_plan_results[case_id] = result
     return result

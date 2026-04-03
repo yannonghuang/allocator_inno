@@ -27,12 +27,12 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/allocator
-      CSV_ROOT_PATH: /app/csv
+      CSV_ROOT_PATH: /data/csv
       # Planning copilot LLM (optional). Set OPENAI_API_KEY in .env or here so the backend can call OpenAI.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./backend:/app
-      - ./csv:/app/csv:ro
+      - ./csv:/data/csv:ro
     # Long keep-alive so proxies don't close; allocation runs in background so request returns quickly
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 300
     depends_on:
